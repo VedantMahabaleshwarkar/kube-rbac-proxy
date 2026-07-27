@@ -54,6 +54,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/brancz/kube-rbac-proxy/cmd/kube-rbac-proxy/app/options"
+	"github.com/brancz/kube-rbac-proxy/pkg/audit"
 	"github.com/brancz/kube-rbac-proxy/pkg/authn"
 	"github.com/brancz/kube-rbac-proxy/pkg/authz"
 	"github.com/brancz/kube-rbac-proxy/pkg/filters"
@@ -138,8 +139,9 @@ type completedProxyRunOptions struct {
 
 	http2Options *http2.Server
 
-	auth *proxy.Config
-	tls  *options.TLSConfig
+	auth        *proxy.Config
+	tls         *options.TLSConfig
+	auditConfig *audit.Config
 
 	kubeClient *kubernetes.Clientset
 
@@ -197,6 +199,21 @@ func Complete(o *options.ProxyRunOptions) (*completedProxyRunOptions, error) {
 	}
 
 	completed.auth.Authorization.PrepareEndpoints()
+
+	// Resolve ISVC metadata for audit logging: CLI flags take precedence over config-file resourceAttributes.
+	isvcName := o.AuditISVCName
+	isvcNamespace := o.AuditISVCNamespace
+	if isvcName == "" && completed.auth.Authorization.ResourceAttributes != nil {
+		isvcName = completed.auth.Authorization.ResourceAttributes.Name
+	}
+	if isvcNamespace == "" && completed.auth.Authorization.ResourceAttributes != nil {
+		isvcNamespace = completed.auth.Authorization.ResourceAttributes.Namespace
+	}
+
+	completed.auditConfig, err = audit.NewConfig(o.AuditLogEnabled, o.AuditLogPath, isvcName, isvcNamespace)
+	if err != nil {
+		return nil, fmt.Errorf("failed to configure audit logging: %w", err)
+	}
 
 	kubeconfig, err := initKubeConfig(o.KubeconfigLocation)
 	if err != nil {
@@ -327,13 +344,16 @@ func Run(cfg *completedProxyRunOptions) error {
 			handlerFunc := proxy.ServeHTTP
 			handlerFunc = filters.WithAuthHeaders(cfg.auth.Authentication.Header, handlerFunc)
 			handlerFunc = filters.WithAuthorization(authorizer, cfg.auth.Authorization, handlerFunc)
+			handlerFunc = audit.PopulateAuditData(handlerFunc)
 			handlerFunc = filters.WithAuthentication(authenticator, cfg.auth.Authentication.Token.Audiences, handlerFunc)
+			handlerFunc = audit.WithAuditLog(handlerFunc, cfg.auditConfig)
 			handlerFunc(w, proxyReq)
 
 			return
 		}
 
-		proxy.ServeHTTP(w, proxyReq)
+		auditHandler := audit.WithAuditLog(proxy.ServeHTTP, cfg.auditConfig)
+		auditHandler(w, proxyReq)
 	})
 	handler = filters.WithAllowPaths(cfg.allowPaths, handler)
 

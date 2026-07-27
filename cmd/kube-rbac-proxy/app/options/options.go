@@ -56,6 +56,11 @@ type ProxyRunOptions struct {
 	QPS   float32
 	Burst int
 
+	AuditLogEnabled    bool
+	AuditLogPath       string
+	AuditISVCName      string
+	AuditISVCNamespace string
+
 	flagSet *pflag.FlagSet
 }
 
@@ -140,6 +145,12 @@ func (o *ProxyRunOptions) Flags() k8sapiflag.NamedFlagSets {
 
 	// disabled flags
 	o.addDisabledFlags(flagset)
+
+	auditFlagset := namedFlagSets.FlagSet("audit")
+	auditFlagset.BoolVar(&o.AuditLogEnabled, "audit-log-enabled", false, "Enable structured JSON audit logging for every proxied request.")
+	auditFlagset.StringVar(&o.AuditLogPath, "audit-log-path", "", "Audit log output destination. Empty or 'stdout' writes to stdout; a file path writes to that file.")
+	auditFlagset.StringVar(&o.AuditISVCName, "audit-isvc-name", "", "Override InferenceService name in audit log entries. If unset, derived from --config-file resourceAttributes.name.")
+	auditFlagset.StringVar(&o.AuditISVCNamespace, "audit-isvc-namespace", "", "Override InferenceService namespace in audit log entries. If unset, derived from --config-file resourceAttributes.namespace.")
 
 	return namedFlagSets
 }
