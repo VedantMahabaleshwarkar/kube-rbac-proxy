@@ -90,12 +90,14 @@ type EndpointResourceRule struct {
 }
 
 // TemplateData is passed to text/template when expanding resourceAttributes in Format2 endpoint rules.
-// Value is set to FromHeader or FromQueryString when those rewrites are populated (supports {{ .Value }} like Format1).
+// Value is set to FromHeader, FromQueryString, or FromPathSegment when those rewrites are populated
+// (supports {{ .Value }} like Format1).
 type TemplateData struct {
 	Value           string
 	FromHeader      string
 	FromQueryString string
 	FromMethod      string
+	FromPathSegment string
 }
 
 // PrepareEndpoints must be called exactly once after building or unmarshaling a Config and
@@ -212,6 +214,12 @@ func validateEndpointResourceRuleRewrites(endpointIndex int, endpointPath string
 			endpointIndex, endpointPath, mappingIndex, resourceIndex,
 		)
 	}
+	if rewrites.ByPathSegment != nil && rewrites.ByPathSegment.Index < 0 {
+		return fmt.Errorf(
+			"authorization.endpoints[%d] (path %q): mappings[%d].resources[%d].rewrites.byPathSegment.index must be >= 0",
+			endpointIndex, endpointPath, mappingIndex, resourceIndex,
+		)
+	}
 	return nil
 }
 
@@ -315,10 +323,19 @@ func attributesFromEndpointResourceRules(userInfo user.Info, request *http.Reque
 			}
 			templateData.FromQueryString = queryValues[0]
 		}
+		if rule.Rewrites.ByPathSegment != nil {
+			segments := strings.Split(path.Clean(request.URL.Path), "/")
+			idx := rule.Rewrites.ByPathSegment.Index + 1 // +1 for leading "/" empty segment
+			if idx >= 0 && idx < len(segments) {
+				templateData.FromPathSegment = segments[idx]
+			}
+		}
 		if templateData.FromHeader != "" {
 			templateData.Value = templateData.FromHeader
 		} else if templateData.FromQueryString != "" {
 			templateData.Value = templateData.FromQueryString
+		} else if templateData.FromPathSegment != "" {
+			templateData.Value = templateData.FromPathSegment
 		}
 
 		resAttrs := rule.ResourceAttributes
@@ -394,6 +411,14 @@ func CollectRewriteParams(request *http.Request, rewrites *SubjectAccessReviewRe
 		headerValues := request.Header.Values(rewrites.ByHTTPHeader.Name)
 		if len(headerValues) > 0 {
 			params = append(params, headerValues...)
+		}
+	}
+
+	if rewrites.ByPathSegment != nil {
+		segments := strings.Split(path.Clean(request.URL.Path), "/")
+		idx := rewrites.ByPathSegment.Index + 1 // +1 for leading "/" empty segment
+		if idx >= 0 && idx < len(segments) {
+			params = append(params, segments[idx])
 		}
 	}
 

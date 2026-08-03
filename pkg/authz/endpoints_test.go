@@ -405,3 +405,164 @@ func TestCollectRewriteParams(t *testing.T) {
 		t.Fatalf("params=%v want len 3", params)
 	}
 }
+
+// --- byPathSegment tests ---
+
+func TestEndpointAttributesFromRequest_ByPathSegment(t *testing.T) {
+	cfg := &Config{
+		Endpoints: []Endpoint{{
+			Path: "/v1/*/namespaces",
+			Mappings: []EndpointMapping{{
+				Methods: []string{"get"},
+				Resources: []EndpointResourceRule{{
+					Rewrites: SubjectAccessReviewRewrites{
+						ByPathSegment: &PathSegmentRewriteConfig{Index: 1},
+					},
+					ResourceAttributes: ResourceAttributes{
+						Namespace: "{{.FromPathSegment}}",
+						APIGroup:  "dataregistry.opendatahub.io",
+						Resource:  "namespaces",
+						Verb:      "list",
+					},
+				}},
+			}},
+		}},
+	}
+	cfg.PrepareEndpoints()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/my-project/namespaces", nil)
+	attrs, matched, err := EndpointAttributesFromRequest(testUser("u"), req, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !matched {
+		t.Fatal("expected path to match")
+	}
+	if len(attrs) != 1 {
+		t.Fatalf("len(attrs)=%d, want 1", len(attrs))
+	}
+	rec := attrs[0].(authorizer.AttributesRecord)
+	if rec.Namespace != "my-project" {
+		t.Fatalf("namespace=%q, want %q", rec.Namespace, "my-project")
+	}
+	if rec.Resource != "namespaces" || rec.APIGroup != "dataregistry.opendatahub.io" || rec.Verb != "list" {
+		t.Fatalf("unexpected record: %#v", rec)
+	}
+}
+
+func TestEndpointAttributesFromRequest_ByPathSegment_Index0(t *testing.T) {
+	cfg := &Config{
+		Endpoints: []Endpoint{{
+			Path: "/api/*",
+			Mappings: []EndpointMapping{{
+				Methods: []string{"get"},
+				Resources: []EndpointResourceRule{{
+					Rewrites: SubjectAccessReviewRewrites{
+						ByPathSegment: &PathSegmentRewriteConfig{Index: 0},
+					},
+					ResourceAttributes: ResourceAttributes{
+						Namespace: "{{.FromPathSegment}}",
+						Resource:  "test",
+						Verb:      "get",
+					},
+				}},
+			}},
+		}},
+	}
+	cfg.PrepareEndpoints()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/segment-zero", nil)
+	attrs, matched, err := EndpointAttributesFromRequest(testUser("u"), req, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !matched {
+		t.Fatal("expected match")
+	}
+	rec := attrs[0].(authorizer.AttributesRecord)
+	if rec.Namespace != "api" {
+		t.Fatalf("namespace=%q, want %q", rec.Namespace, "api")
+	}
+}
+
+func TestEndpointAttributesFromRequest_ByPathSegment_ValueFallback(t *testing.T) {
+	cfg := &Config{
+		Endpoints: []Endpoint{{
+			Path: "/v1/*/namespaces/*/tables",
+			Mappings: []EndpointMapping{{
+				Methods: []string{"get"},
+				Resources: []EndpointResourceRule{{
+					Rewrites: SubjectAccessReviewRewrites{
+						ByPathSegment: &PathSegmentRewriteConfig{Index: 1},
+					},
+					ResourceAttributes: ResourceAttributes{
+						Namespace: "{{.Value}}",
+						APIGroup:  "dataregistry.opendatahub.io",
+						Resource:  "tables",
+						Verb:      "list",
+					},
+				}},
+			}},
+		}},
+	}
+	cfg.PrepareEndpoints()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/insurance-demo/namespaces/claims/tables", nil)
+	attrs, _, err := EndpointAttributesFromRequest(testUser("u"), req, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := attrs[0].(authorizer.AttributesRecord)
+	if rec.Namespace != "insurance-demo" {
+		t.Fatalf("namespace=%q, want %q (via .Value fallback)", rec.Namespace, "insurance-demo")
+	}
+}
+
+func TestValidateAuthorizationConfig_ByPathSegmentNegativeIndex(t *testing.T) {
+	cfg := &Config{
+		Endpoints: []Endpoint{{
+			Path: "/v1/*/namespaces",
+			Mappings: []EndpointMapping{{
+				Methods: []string{"get"},
+				Resources: []EndpointResourceRule{{
+					Rewrites: SubjectAccessReviewRewrites{
+						ByPathSegment: &PathSegmentRewriteConfig{Index: -1},
+					},
+					ResourceAttributes: ResourceAttributes{Resource: "test", Verb: "get"},
+				}},
+			}},
+		}},
+	}
+	err := ValidateAuthorizationConfig(cfg)
+	if err == nil {
+		t.Fatal("expected validation error for negative index")
+	}
+	if !strings.Contains(err.Error(), "byPathSegment") {
+		t.Fatalf("error should mention byPathSegment: %v", err)
+	}
+}
+
+func TestCollectRewriteParams_ByPathSegment(t *testing.T) {
+	rw := &SubjectAccessReviewRewrites{
+		ByPathSegment: &PathSegmentRewriteConfig{Index: 1},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/my-namespace/namespaces", nil)
+	params := CollectRewriteParams(req, rw)
+	if len(params) != 1 {
+		t.Fatalf("params=%v want len 1", params)
+	}
+	if params[0] != "my-namespace" {
+		t.Fatalf("params[0]=%q, want %q", params[0], "my-namespace")
+	}
+}
+
+func TestCollectRewriteParams_ByPathSegment_OutOfBounds(t *testing.T) {
+	rw := &SubjectAccessReviewRewrites{
+		ByPathSegment: &PathSegmentRewriteConfig{Index: 99},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/ns", nil)
+	params := CollectRewriteParams(req, rw)
+	if len(params) != 0 {
+		t.Fatalf("params=%v want empty (out of bounds)", params)
+	}
+}
