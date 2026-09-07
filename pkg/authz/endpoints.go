@@ -323,12 +323,12 @@ func attributesFromEndpointResourceRules(userInfo user.Info, request *http.Reque
 			}
 			templateData.FromQueryString = queryValues[0]
 		}
-		if rule.Rewrites.ByPathSegment != nil {
-			segments := strings.Split(path.Clean(request.URL.Path), "/")
-			idx := rule.Rewrites.ByPathSegment.Index + 1 // +1 for leading "/" empty segment
-			if idx >= 0 && idx < len(segments) {
-				templateData.FromPathSegment = segments[idx]
+		if cfg := rule.Rewrites.ByPathSegment; cfg != nil {
+			value, ok := extractPathSegment(request.URL.Path, cfg.Index)
+			if !ok {
+				return nil, fmt.Errorf("required path segment index %d is missing or empty", cfg.Index)
 			}
+			templateData.FromPathSegment = value
 		}
 		if templateData.FromHeader != "" {
 			templateData.Value = templateData.FromHeader
@@ -394,6 +394,28 @@ func rewriteQueryParamName(rewrites *SubjectAccessReviewRewrites) string {
 	return ""
 }
 
+// extractPathSegment extracts a path segment at the given index after normalizing the path.
+// It returns the segment value and true if the index is valid and the segment is non-empty,
+// or an empty string and false otherwise. The path is cleaned with path.Clean before extraction
+// to normalize repeated slashes, ".", "..", and trailing slashes. The index is 0-based and
+// accounts for the leading "/" producing an empty segment at position 0.
+func extractPathSegment(urlPath string, index int) (string, bool) {
+	if index < 0 {
+		return "", false
+	}
+	segments := strings.Split(path.Clean(urlPath), "/")
+	// +1 to account for the leading "/" which produces an empty segment at index 0
+	idx := index + 1
+	if idx >= len(segments) {
+		return "", false
+	}
+	value := segments[idx]
+	if value == "" {
+		return "", false
+	}
+	return value, true
+}
+
 // CollectRewriteParams gathers rewrite values for Format1 authorization using the same
 // header and query keys as SubjectAccessReviewRewrites.
 func CollectRewriteParams(request *http.Request, rewrites *SubjectAccessReviewRewrites) []string {
@@ -415,10 +437,8 @@ func CollectRewriteParams(request *http.Request, rewrites *SubjectAccessReviewRe
 	}
 
 	if rewrites.ByPathSegment != nil {
-		segments := strings.Split(path.Clean(request.URL.Path), "/")
-		idx := rewrites.ByPathSegment.Index + 1 // +1 for leading "/" empty segment
-		if idx >= 0 && idx < len(segments) {
-			params = append(params, segments[idx])
+		if value, ok := extractPathSegment(request.URL.Path, rewrites.ByPathSegment.Index); ok {
+			params = append(params, value)
 		}
 	}
 

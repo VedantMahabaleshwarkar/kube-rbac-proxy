@@ -543,16 +543,69 @@ func TestValidateAuthorizationConfig_ByPathSegmentNegativeIndex(t *testing.T) {
 }
 
 func TestCollectRewriteParams_ByPathSegment(t *testing.T) {
-	rw := &SubjectAccessReviewRewrites{
-		ByPathSegment: &PathSegmentRewriteConfig{Index: 1},
+	cases := []struct {
+		name          string
+		path          string
+		index         int
+		wantValue     string
+		wantParamLen  int
+	}{
+		{
+			name:         "basic path",
+			path:         "/v1/my-namespace/namespaces",
+			index:        1,
+			wantValue:    "my-namespace",
+			wantParamLen: 1,
+		},
+		{
+			name:         "repeated slashes normalized",
+			path:         "//v1///my-namespace//namespaces",
+			index:        1,
+			wantValue:    "my-namespace",
+			wantParamLen: 1,
+		},
+		{
+			name:         "trailing slash normalized",
+			path:         "/v1/my-namespace/namespaces/",
+			index:        1,
+			wantValue:    "my-namespace",
+			wantParamLen: 1,
+		},
+		{
+			name:         ".. segment normalized",
+			path:         "/v1/../v1/my-namespace/namespaces",
+			index:        1,
+			wantValue:    "my-namespace",
+			wantParamLen: 1,
+		},
+		{
+			name:         "out of bounds index",
+			path:         "/v1/ns",
+			index:        99,
+			wantParamLen: 0,
+		},
+		{
+			name:         "negative index",
+			path:         "/v1/ns",
+			index:        -1,
+			wantParamLen: 0,
+		},
 	}
-	req := httptest.NewRequest(http.MethodGet, "/v1/my-namespace/namespaces", nil)
-	params := CollectRewriteParams(req, rw)
-	if len(params) != 1 {
-		t.Fatalf("params=%v want len 1", params)
-	}
-	if params[0] != "my-namespace" {
-		t.Fatalf("params[0]=%q, want %q", params[0], "my-namespace")
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rw := &SubjectAccessReviewRewrites{
+				ByPathSegment: &PathSegmentRewriteConfig{Index: tc.index},
+			}
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			params := CollectRewriteParams(req, rw)
+			if len(params) != tc.wantParamLen {
+				t.Fatalf("params=%v want len %d", params, tc.wantParamLen)
+			}
+			if tc.wantParamLen > 0 && params[0] != tc.wantValue {
+				t.Fatalf("params[0]=%q, want %q", params[0], tc.wantValue)
+			}
+		})
 	}
 }
 
@@ -564,5 +617,113 @@ func TestCollectRewriteParams_ByPathSegment_OutOfBounds(t *testing.T) {
 	params := CollectRewriteParams(req, rw)
 	if len(params) != 0 {
 		t.Fatalf("params=%v want empty (out of bounds)", params)
+	}
+}
+
+func TestEndpointAttributesFromRequest_ByPathSegment_OutOfRange(t *testing.T) {
+	cfg := &Config{
+		Endpoints: []Endpoint{{
+			Path: "/v1/namespaces",
+			Mappings: []EndpointMapping{{
+				Methods: []string{"get"},
+				Resources: []EndpointResourceRule{{
+					Rewrites: SubjectAccessReviewRewrites{
+						ByPathSegment: &PathSegmentRewriteConfig{Index: 99},
+					},
+					ResourceAttributes: ResourceAttributes{
+						Namespace: "{{.FromPathSegment}}",
+						Resource:  "test",
+						Verb:      "get",
+					},
+				}},
+			}},
+		}},
+	}
+	cfg.PrepareEndpoints()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/namespaces", nil)
+	_, matched, err := EndpointAttributesFromRequest(testUser("u"), req, cfg)
+	if !matched {
+		t.Fatal("expected path to match")
+	}
+	if err == nil {
+		t.Fatal("expected error for out-of-range index")
+	}
+	if !strings.Contains(err.Error(), "path segment index 99") {
+		t.Fatalf("error should mention the index: %v", err)
+	}
+}
+
+func TestEndpointAttributesFromRequest_ByPathSegment_PathNormalization(t *testing.T) {
+	cases := []struct {
+		name      string
+		path      string
+		index     int
+		wantValue string
+	}{
+		{
+			name:      "repeated slashes",
+			path:      "//v1///my-project//namespaces",
+			index:     1,
+			wantValue: "my-project",
+		},
+		{
+			name:      "trailing slash",
+			path:      "/v1/my-project/namespaces/",
+			index:     1,
+			wantValue: "my-project",
+		},
+		{
+			name:      ".. segments",
+			path:      "/v1/../v1/my-project/namespaces",
+			index:     1,
+			wantValue: "my-project",
+		},
+		{
+			name:      "combined normalization",
+			path:      "//v1//.././/v1///my-project//namespaces/",
+			index:     1,
+			wantValue: "my-project",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{
+				Endpoints: []Endpoint{{
+					Path: "/v1/*/namespaces",
+					Mappings: []EndpointMapping{{
+						Methods: []string{"get"},
+						Resources: []EndpointResourceRule{{
+							Rewrites: SubjectAccessReviewRewrites{
+								ByPathSegment: &PathSegmentRewriteConfig{Index: tc.index},
+							},
+							ResourceAttributes: ResourceAttributes{
+								Namespace: "{{.FromPathSegment}}",
+								Resource:  "namespaces",
+								Verb:      "list",
+							},
+						}},
+					}},
+				}},
+			}
+			cfg.PrepareEndpoints()
+
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			attrs, matched, err := EndpointAttributesFromRequest(testUser("u"), req, cfg)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !matched {
+				t.Fatal("expected path to match")
+			}
+			if len(attrs) != 1 {
+				t.Fatalf("len(attrs)=%d, want 1", len(attrs))
+			}
+			rec := attrs[0].(authorizer.AttributesRecord)
+			if rec.Namespace != tc.wantValue {
+				t.Fatalf("namespace=%q, want %q", rec.Namespace, tc.wantValue)
+			}
+		})
 	}
 }
