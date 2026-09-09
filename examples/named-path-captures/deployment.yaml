@@ -1,0 +1,154 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: named-captures
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-a
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-rbac-proxy
+  namespace: named-captures
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: job-reader
+  namespace: tenant-a
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: named-captures-kube-rbac-proxy
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: named-captures-kube-rbac-proxy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: named-captures-kube-rbac-proxy
+subjects:
+  - kind: ServiceAccount
+    name: kube-rbac-proxy
+    namespace: named-captures
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: named-job-reader
+  namespace: tenant-a
+rules:
+  - apiGroups:
+      - batch.example.io
+    resources:
+      - jobs
+    resourceNames:
+      - job-123
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: named-job-reader
+  namespace: tenant-a
+subjects:
+  - kind: ServiceAccount
+    name: job-reader
+    namespace: tenant-a
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: named-job-reader
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kube-rbac-proxy-config
+  namespace: named-captures
+data:
+  config-file.yaml: |
+    authorization:
+      endpoints:
+        # {tenant} supplies the SAR namespace and {id} supplies its resource name.
+        - path: /api/v1/tenants/{tenant}/jobs/{id}
+          mappings:
+            - methods: [get]
+              resources:
+                - resourceAttributes:
+                    apiGroup: batch.example.io
+                    resource: jobs
+                    namespace: '{{ index .PathParams "tenant" }}'
+                    name: '{{ index .PathParams "id" }}'
+                    verb: get
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-rbac-proxy
+  namespace: named-captures
+spec:
+  selector:
+    app: kube-rbac-proxy
+  ports:
+    - name: https
+      port: 8443
+      targetPort: 8443
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-rbac-proxy
+  namespace: named-captures
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kube-rbac-proxy
+  template:
+    metadata:
+      labels:
+        app: kube-rbac-proxy
+    spec:
+      serviceAccountName: kube-rbac-proxy
+      securityContext:
+        runAsUser: 65532
+      containers:
+        - name: kube-rbac-proxy
+          image: kube-rbac-proxy:named-path-captures
+          imagePullPolicy: IfNotPresent
+          args:
+            - --secure-listen-address=0.0.0.0:8443
+            - --upstream=http://127.0.0.1:8081/
+            - --config-file=/etc/kube-rbac-proxy/config-file.yaml
+            - --logtostderr=true
+            - --v=5
+          ports:
+            - name: https
+              containerPort: 8443
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kube-rbac-proxy
+          securityContext:
+            allowPrivilegeEscalation: false
+        - name: prometheus-example-app
+          image: quay.io/brancz/prometheus-example-app:v0.5.0
+          args:
+            - --bind=127.0.0.1:8081
+      volumes:
+        - name: config
+          configMap:
+            name: kube-rbac-proxy-config

@@ -20,6 +20,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -406,23 +407,42 @@ func TestCollectRewriteParams(t *testing.T) {
 	}
 }
 
-// --- byPathSegment tests ---
+func TestMatchEndpoint_CapturesNamedSegments(t *testing.T) {
+	cases := []struct {
+		pattern string
+		path    string
+		want    map[string]string
+	}{
+		{"/api/v1/tenants/{tenant}/metrics", "/api/v1/tenants/tenant-a/metrics", map[string]string{"tenant": "tenant-a"}},
+		{"/api/{version}/tenants/{tenant}/jobs/{job}", "/api/v2/tenants/my-ns/jobs/job-1", map[string]string{"version": "v2", "tenant": "my-ns", "job": "job-1"}},
+		{"/api/v1/jobs/*/{id}", "/api/v1/jobs/queue/123", map[string]string{"id": "123"}},
+		{"/api/v1/jobs", "/api/v1/jobs", map[string]string{}},
+	}
+	for _, c := range cases {
+		ep := Endpoint{Path: c.pattern, PathParts: strings.Split(c.pattern, "/")}
+		matched, captured := MatchEndpointCaptures(c.path, ep)
+		if !matched {
+			t.Errorf("MatchEndpoint(%q, %q): expected match", c.path, c.pattern)
+			continue
+		}
+		if !reflect.DeepEqual(captured, c.want) {
+			t.Errorf("MatchEndpoint(%q, %q) captured=%v, want %v", c.path, c.pattern, captured, c.want)
+		}
+	}
+}
 
-func TestEndpointAttributesFromRequest_ByPathSegment(t *testing.T) {
+func TestEndpointAttributesFromRequest_NamedPathCaptures(t *testing.T) {
 	cfg := &Config{
 		Endpoints: []Endpoint{{
-			Path: "/v1/*/namespaces",
+			Path: "/api/v1/tenants/{tenant}/reports/{report}",
 			Mappings: []EndpointMapping{{
 				Methods: []string{"get"},
 				Resources: []EndpointResourceRule{{
-					Rewrites: SubjectAccessReviewRewrites{
-						ByPathSegment: &PathSegmentRewriteConfig{Index: 1},
-					},
 					ResourceAttributes: ResourceAttributes{
-						Namespace: "{{.FromPathSegment}}",
-						APIGroup:  "dataregistry.opendatahub.io",
-						Resource:  "namespaces",
-						Verb:      "list",
+						Namespace: "{{ index .PathParams \"tenant\" }}",
+						Name:      "{{ index .PathParams \"report\" }}",
+						APIGroup:  "reports.example.io",
+						Resource:  "reports",
 					},
 				}},
 			}},
@@ -430,7 +450,7 @@ func TestEndpointAttributesFromRequest_ByPathSegment(t *testing.T) {
 	}
 	cfg.PrepareEndpoints()
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/my-project/namespaces", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/tenants/tenant-a/reports/report-17", nil)
 	attrs, matched, err := EndpointAttributesFromRequest(testUser("u"), req, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -442,28 +462,24 @@ func TestEndpointAttributesFromRequest_ByPathSegment(t *testing.T) {
 		t.Fatalf("len(attrs)=%d, want 1", len(attrs))
 	}
 	rec := attrs[0].(authorizer.AttributesRecord)
-	if rec.Namespace != "my-project" {
-		t.Fatalf("namespace=%q, want %q", rec.Namespace, "my-project")
+	if rec.Namespace != "tenant-a" || rec.Name != "report-17" {
+		t.Fatalf("unexpected resource identity: namespace=%q name=%q", rec.Namespace, rec.Name)
 	}
-	if rec.Resource != "namespaces" || rec.APIGroup != "dataregistry.opendatahub.io" || rec.Verb != "list" {
-		t.Fatalf("unexpected record: %#v", rec)
+	if rec.APIGroup != "reports.example.io" || rec.Resource != "reports" {
+		t.Fatalf("unexpected resource: apiGroup=%q resource=%q", rec.APIGroup, rec.Resource)
 	}
 }
 
-func TestEndpointAttributesFromRequest_ByPathSegment_Index0(t *testing.T) {
+func TestEndpointAttributesFromRequest_PathDoesNotPopulateValue(t *testing.T) {
 	cfg := &Config{
 		Endpoints: []Endpoint{{
-			Path: "/api/*",
+			Path: "/api/v1/namespaces/{namespace}/pods",
 			Mappings: []EndpointMapping{{
 				Methods: []string{"get"},
 				Resources: []EndpointResourceRule{{
-					Rewrites: SubjectAccessReviewRewrites{
-						ByPathSegment: &PathSegmentRewriteConfig{Index: 0},
-					},
 					ResourceAttributes: ResourceAttributes{
-						Namespace: "{{.FromPathSegment}}",
-						Resource:  "test",
-						Verb:      "get",
+						Namespace: "{{.Value}}",
+						Resource:  "pods",
 					},
 				}},
 			}},
@@ -471,7 +487,7 @@ func TestEndpointAttributesFromRequest_ByPathSegment_Index0(t *testing.T) {
 	}
 	cfg.PrepareEndpoints()
 
-	req := httptest.NewRequest(http.MethodGet, "/api/segment-zero", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/kube-system/pods", nil)
 	attrs, matched, err := EndpointAttributesFromRequest(testUser("u"), req, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -480,26 +496,26 @@ func TestEndpointAttributesFromRequest_ByPathSegment_Index0(t *testing.T) {
 		t.Fatal("expected match")
 	}
 	rec := attrs[0].(authorizer.AttributesRecord)
-	if rec.Namespace != "api" {
-		t.Fatalf("namespace=%q, want %q", rec.Namespace, "api")
+	if rec.Namespace != "" {
+		t.Fatalf("Namespace=%q, want empty because .Value is reserved for rewrites", rec.Namespace)
 	}
 }
 
-func TestEndpointAttributesFromRequest_ByPathSegment_ValueFallback(t *testing.T) {
+func TestEndpointAttributesFromRequest_LegacyWildcardHeaderRewrite(t *testing.T) {
+	// Legacy '*' segments still match, while the header supplies .Value for the SAR template.
 	cfg := &Config{
 		Endpoints: []Endpoint{{
-			Path: "/v1/*/namespaces/*/tables",
+			Path: "/api/v1/tenants/*/events",
 			Mappings: []EndpointMapping{{
-				Methods: []string{"get"},
+				Methods: []string{"post"},
 				Resources: []EndpointResourceRule{{
 					Rewrites: SubjectAccessReviewRewrites{
-						ByPathSegment: &PathSegmentRewriteConfig{Index: 1},
+						ByHTTPHeader: &HTTPHeaderRewriteConfig{Name: "X-Tenant"},
 					},
 					ResourceAttributes: ResourceAttributes{
 						Namespace: "{{.Value}}",
-						APIGroup:  "dataregistry.opendatahub.io",
-						Resource:  "tables",
-						Verb:      "list",
+						Resource:  "events",
+						Verb:      "create",
 					},
 				}},
 			}},
@@ -507,223 +523,15 @@ func TestEndpointAttributesFromRequest_ByPathSegment_ValueFallback(t *testing.T)
 	}
 	cfg.PrepareEndpoints()
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/insurance-demo/namespaces/claims/tables", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tenants/path-ns/events", nil)
+	req.Header.Set("X-Tenant", "header-ns")
+
 	attrs, _, err := EndpointAttributesFromRequest(testUser("u"), req, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	rec := attrs[0].(authorizer.AttributesRecord)
-	if rec.Namespace != "insurance-demo" {
-		t.Fatalf("namespace=%q, want %q (via .Value fallback)", rec.Namespace, "insurance-demo")
-	}
-}
-
-func TestValidateAuthorizationConfig_ByPathSegmentNegativeIndex(t *testing.T) {
-	cfg := &Config{
-		Endpoints: []Endpoint{{
-			Path: "/v1/*/namespaces",
-			Mappings: []EndpointMapping{{
-				Methods: []string{"get"},
-				Resources: []EndpointResourceRule{{
-					Rewrites: SubjectAccessReviewRewrites{
-						ByPathSegment: &PathSegmentRewriteConfig{Index: -1},
-					},
-					ResourceAttributes: ResourceAttributes{Resource: "test", Verb: "get"},
-				}},
-			}},
-		}},
-	}
-	err := ValidateAuthorizationConfig(cfg)
-	if err == nil {
-		t.Fatal("expected validation error for negative index")
-	}
-	if !strings.Contains(err.Error(), "byPathSegment") {
-		t.Fatalf("error should mention byPathSegment: %v", err)
-	}
-}
-
-func TestCollectRewriteParams_ByPathSegment(t *testing.T) {
-	cases := []struct {
-		name          string
-		path          string
-		index         int
-		wantValue     string
-		wantParamLen  int
-	}{
-		{
-			name:         "basic path",
-			path:         "/v1/my-namespace/namespaces",
-			index:        1,
-			wantValue:    "my-namespace",
-			wantParamLen: 1,
-		},
-		{
-			name:         "repeated slashes normalized",
-			path:         "//v1///my-namespace//namespaces",
-			index:        1,
-			wantValue:    "my-namespace",
-			wantParamLen: 1,
-		},
-		{
-			name:         "trailing slash normalized",
-			path:         "/v1/my-namespace/namespaces/",
-			index:        1,
-			wantValue:    "my-namespace",
-			wantParamLen: 1,
-		},
-		{
-			name:         ".. segment normalized",
-			path:         "/v1/../v1/my-namespace/namespaces",
-			index:        1,
-			wantValue:    "my-namespace",
-			wantParamLen: 1,
-		},
-		{
-			name:         "out of bounds index",
-			path:         "/v1/ns",
-			index:        99,
-			wantParamLen: 0,
-		},
-		{
-			name:         "negative index",
-			path:         "/v1/ns",
-			index:        -1,
-			wantParamLen: 0,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			rw := &SubjectAccessReviewRewrites{
-				ByPathSegment: &PathSegmentRewriteConfig{Index: tc.index},
-			}
-			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
-			params := CollectRewriteParams(req, rw)
-			if len(params) != tc.wantParamLen {
-				t.Fatalf("params=%v want len %d", params, tc.wantParamLen)
-			}
-			if tc.wantParamLen > 0 && params[0] != tc.wantValue {
-				t.Fatalf("params[0]=%q, want %q", params[0], tc.wantValue)
-			}
-		})
-	}
-}
-
-func TestCollectRewriteParams_ByPathSegment_OutOfBounds(t *testing.T) {
-	rw := &SubjectAccessReviewRewrites{
-		ByPathSegment: &PathSegmentRewriteConfig{Index: 99},
-	}
-	req := httptest.NewRequest(http.MethodGet, "/v1/ns", nil)
-	params := CollectRewriteParams(req, rw)
-	if len(params) != 0 {
-		t.Fatalf("params=%v want empty (out of bounds)", params)
-	}
-}
-
-func TestEndpointAttributesFromRequest_ByPathSegment_OutOfRange(t *testing.T) {
-	cfg := &Config{
-		Endpoints: []Endpoint{{
-			Path: "/v1/namespaces",
-			Mappings: []EndpointMapping{{
-				Methods: []string{"get"},
-				Resources: []EndpointResourceRule{{
-					Rewrites: SubjectAccessReviewRewrites{
-						ByPathSegment: &PathSegmentRewriteConfig{Index: 99},
-					},
-					ResourceAttributes: ResourceAttributes{
-						Namespace: "{{.FromPathSegment}}",
-						Resource:  "test",
-						Verb:      "get",
-					},
-				}},
-			}},
-		}},
-	}
-	cfg.PrepareEndpoints()
-
-	req := httptest.NewRequest(http.MethodGet, "/v1/namespaces", nil)
-	_, matched, err := EndpointAttributesFromRequest(testUser("u"), req, cfg)
-	if !matched {
-		t.Fatal("expected path to match")
-	}
-	if err == nil {
-		t.Fatal("expected error for out-of-range index")
-	}
-	if !strings.Contains(err.Error(), "path segment index 99") {
-		t.Fatalf("error should mention the index: %v", err)
-	}
-}
-
-func TestEndpointAttributesFromRequest_ByPathSegment_PathNormalization(t *testing.T) {
-	cases := []struct {
-		name      string
-		path      string
-		index     int
-		wantValue string
-	}{
-		{
-			name:      "repeated slashes",
-			path:      "//v1///my-project//namespaces",
-			index:     1,
-			wantValue: "my-project",
-		},
-		{
-			name:      "trailing slash",
-			path:      "/v1/my-project/namespaces/",
-			index:     1,
-			wantValue: "my-project",
-		},
-		{
-			name:      ".. segments",
-			path:      "/v1/../v1/my-project/namespaces",
-			index:     1,
-			wantValue: "my-project",
-		},
-		{
-			name:      "combined normalization",
-			path:      "//v1//.././/v1///my-project//namespaces/",
-			index:     1,
-			wantValue: "my-project",
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := &Config{
-				Endpoints: []Endpoint{{
-					Path: "/v1/*/namespaces",
-					Mappings: []EndpointMapping{{
-						Methods: []string{"get"},
-						Resources: []EndpointResourceRule{{
-							Rewrites: SubjectAccessReviewRewrites{
-								ByPathSegment: &PathSegmentRewriteConfig{Index: tc.index},
-							},
-							ResourceAttributes: ResourceAttributes{
-								Namespace: "{{.FromPathSegment}}",
-								Resource:  "namespaces",
-								Verb:      "list",
-							},
-						}},
-					}},
-				}},
-			}
-			cfg.PrepareEndpoints()
-
-			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
-			attrs, matched, err := EndpointAttributesFromRequest(testUser("u"), req, cfg)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if !matched {
-				t.Fatal("expected path to match")
-			}
-			if len(attrs) != 1 {
-				t.Fatalf("len(attrs)=%d, want 1", len(attrs))
-			}
-			rec := attrs[0].(authorizer.AttributesRecord)
-			if rec.Namespace != tc.wantValue {
-				t.Fatalf("namespace=%q, want %q", rec.Namespace, tc.wantValue)
-			}
-		})
+	if rec.Namespace != "header-ns" {
+		t.Fatalf("Namespace=%q, want %q (legacy wildcard must not replace header .Value)", rec.Namespace, "header-ns")
 	}
 }

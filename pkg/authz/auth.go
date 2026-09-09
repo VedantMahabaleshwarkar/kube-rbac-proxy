@@ -47,7 +47,6 @@ type Config struct {
 type SubjectAccessReviewRewrites struct {
 	ByQueryParameter *QueryParameterRewriteConfig `json:"byQueryParameter,omitempty"`
 	ByHTTPHeader     *HTTPHeaderRewriteConfig     `json:"byHttpHeader,omitempty"`
-	ByPathSegment    *PathSegmentRewriteConfig    `json:"byPathSegment,omitempty"`
 }
 
 // QueryParameterRewriteConfig describes which HTTP URL query parameter is to
@@ -60,13 +59,6 @@ type QueryParameterRewriteConfig struct {
 // be used to rewrite a SubjectAccessReview on a given request.
 type HTTPHeaderRewriteConfig struct {
 	Name string `json:"name,omitempty"`
-}
-
-// PathSegmentRewriteConfig describes which URL path segment (0-based index)
-// is to be used to rewrite a SubjectAccessReview on a given request.
-// For example, with path /v1/my-namespace/namespaces/..., index 1 extracts "my-namespace".
-type PathSegmentRewriteConfig struct {
-	Index int `json:"index"`
 }
 
 // ResourceAttributes describes attributes available for resource request authorization

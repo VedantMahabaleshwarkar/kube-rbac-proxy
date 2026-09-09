@@ -34,7 +34,7 @@ limitations under the License.
 //
 //	authorization:
 //	  endpoints:
-//	    - path: /api/v1/evaluations/jobs/*/events
+//	    - path: /api/v1/tenants/{tenant}/events
 //	      mappings:
 //	        - methods: [post]
 //	          resources:
@@ -42,7 +42,7 @@ limitations under the License.
 //	                byHttpHeader:
 //	                  name: X-Tenant
 //	              resourceAttributes:
-//	                namespace: "{{.FromHeader}}"
+//	                namespace: '{{ index .PathParams "tenant" }}'
 //	                apiGroup: trustyai.opendatahub.io
 //	                resource: status-events
 //	                verb: create
@@ -70,7 +70,10 @@ import (
 // (e.g. filters.WithAuthorization) may map this to HTTP 403 Forbidden.
 var ErrEndpointMethodNotAllowed = errors.New("HTTP method not allowed for matched authorization endpoint")
 
-// Endpoint describes path-scoped SAR mappings (Format2).
+// Endpoint describes path-scoped SAR mappings (Format2). Path segments may contain
+// named captures in the form {name}; captured values are available to templates
+// through .PathParams. The legacy * segment remains supported as a match-only
+// placeholder and is not exposed to templates.
 type Endpoint struct {
 	Path      string            `json:"path,omitempty"`
 	Mappings  []EndpointMapping `json:"mappings,omitempty"`
@@ -90,14 +93,14 @@ type EndpointResourceRule struct {
 }
 
 // TemplateData is passed to text/template when expanding resourceAttributes in Format2 endpoint rules.
-// Value is set to FromHeader, FromQueryString, or FromPathSegment when those rewrites are populated
-// (supports {{ .Value }} like Format1).
+// PathParams contains values captured by named endpoint path segments. Value remains
+// compatible with header and query rewrites and is intentionally not populated from paths.
 type TemplateData struct {
 	Value           string
 	FromHeader      string
 	FromQueryString string
 	FromMethod      string
-	FromPathSegment string
+	PathParams      map[string]string
 }
 
 // PrepareEndpoints must be called exactly once after building or unmarshaling a Config and
@@ -123,17 +126,29 @@ func (cfg *Config) prepareEndpointPatterns() {
 }
 
 // MatchEndpoint reports whether requestPath matches the configured endpoint pattern.
+// It preserves the original boolean-only API; use MatchEndpointCaptures when named
+// path values are needed.
 // requestPath is cleaned with path.Clean (collapse duplicate slashes, ".", "..", trailing slash)
 // before splitting. Matching is exact by segment count against endpoint.Path (after PrepareEndpoints).
-// A pattern segment "*" matches exactly one request segment; it does not match zero or multiple trailing segments.
+// A named capture segment such as "{tenant}" matches exactly one request segment;
+// it does not match zero or multiple trailing segments.
+
 func MatchEndpoint(requestPath string, endpoint Endpoint) bool {
+	matched, _ := matchEndpoint(requestPath, endpoint)
+	return matched
+}
+
+// MatchEndpointCaptures reports whether requestPath matches and returns values captured
+// by named path segments. A segment such as {tenant} captures one request segment under
+// the key "tenant". The legacy "*" segment matches one request segment but is not captured.
+func MatchEndpointCaptures(requestPath string, endpoint Endpoint) (bool, map[string]string) {
 	return matchEndpoint(requestPath, endpoint)
 }
 
-func matchEndpoint(requestPath string, endpoint Endpoint) bool {
+func matchEndpoint(requestPath string, endpoint Endpoint) (bool, map[string]string) {
 	patternParts := endpoint.PathParts
 	if len(patternParts) == 0 {
-		return false
+		return false, nil
 	}
 	if requestPath == "" {
 		requestPath = "/"
@@ -141,15 +156,40 @@ func matchEndpoint(requestPath string, endpoint Endpoint) bool {
 	requestPath = path.Clean(requestPath)
 	endpointParts := strings.Split(requestPath, "/")
 	if len(endpointParts) != len(patternParts) {
-		return false
+		return false, nil
 	}
+	captured := map[string]string{}
 	for segmentIndex, patternSegment := range patternParts {
+		if strings.HasPrefix(patternSegment, "{") && strings.HasSuffix(patternSegment, "}") {
+			name := patternSegment[1 : len(patternSegment)-1]
+			if !validPathCaptureName(name) || captured[name] != "" {
+				return false, nil
+			}
+			captured[name] = endpointParts[segmentIndex]
+			continue
+		}
 		if patternSegment == "*" {
 			continue
 		}
-		if endpointParts[segmentIndex] != patternSegment {
-			return false
+		if strings.ContainsAny(patternSegment, "{}") {
+			return false, nil
 		}
+		if endpointParts[segmentIndex] != patternSegment {
+			return false, nil
+		}
+	}
+	return true, captured
+}
+
+func validPathCaptureName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for index, char := range name {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (index > 0 && char >= '0' && char <= '9') || (index > 0 && char == '_') {
+			continue
+		}
+		return false
 	}
 	return true
 }
@@ -181,6 +221,22 @@ func ValidateAuthorizationConfig(cfg *Config) error {
 		if len(endpoint.Mappings) == 0 {
 			return fmt.Errorf("authorization.endpoints[%d] (path %q): mappings must contain at least one entry", endpointIndex, endpoint.Path)
 		}
+		captureNames := map[string]struct{}{}
+		for _, segment := range strings.Split(endpoint.Path, "/") {
+			if strings.HasPrefix(segment, "{") || strings.HasSuffix(segment, "}") || strings.ContainsAny(segment, "{}") {
+				if len(segment) < 3 || segment[0] != '{' || segment[len(segment)-1] != '}' {
+					return fmt.Errorf("authorization.endpoints[%d] (path %q): malformed path capture %q", endpointIndex, endpoint.Path, segment)
+				}
+				name := segment[1 : len(segment)-1]
+				if !validPathCaptureName(name) {
+					return fmt.Errorf("authorization.endpoints[%d] (path %q): invalid path capture name %q", endpointIndex, endpoint.Path, name)
+				}
+				if _, exists := captureNames[name]; exists {
+					return fmt.Errorf("authorization.endpoints[%d] (path %q): duplicate path capture %q", endpointIndex, endpoint.Path, name)
+				}
+				captureNames[name] = struct{}{}
+			}
+		}
 		for mappingIndex, mapping := range endpoint.Mappings {
 			if len(mapping.Methods) == 0 {
 				return fmt.Errorf("authorization.endpoints[%d] (path %q): mappings[%d] must specify a non-empty methods list", endpointIndex, endpoint.Path, mappingIndex)
@@ -211,12 +267,6 @@ func validateEndpointResourceRuleRewrites(endpointIndex int, endpointPath string
 	if rewrites.ByQueryParameter != nil && strings.TrimSpace(rewrites.ByQueryParameter.Name) == "" {
 		return fmt.Errorf(
 			"authorization.endpoints[%d] (path %q): mappings[%d].resources[%d].rewrites.byQueryParameter must specify a non-empty name",
-			endpointIndex, endpointPath, mappingIndex, resourceIndex,
-		)
-	}
-	if rewrites.ByPathSegment != nil && rewrites.ByPathSegment.Index < 0 {
-		return fmt.Errorf(
-			"authorization.endpoints[%d] (path %q): mappings[%d].resources[%d].rewrites.byPathSegment.index must be >= 0",
 			endpointIndex, endpointPath, mappingIndex, resourceIndex,
 		)
 	}
@@ -290,23 +340,24 @@ func EndpointAttributesFromRequest(userInfo user.Info, request *http.Request, cf
 		return nil, false, nil
 	}
 	for _, endpoint := range cfg.Endpoints {
-		if !matchEndpoint(request.URL.Path, endpoint) {
+		matched, pathParams := matchEndpoint(request.URL.Path, endpoint)
+		if !matched {
 			continue
 		}
 		rules, methodOK := rulesForEndpointMethod(request, endpoint)
 		if !methodOK {
 			return nil, true, ErrEndpointMethodNotAllowed
 		}
-		attrs, err := attributesFromEndpointResourceRules(userInfo, request, rules)
+		attrs, err := attributesFromEndpointResourceRules(userInfo, request, rules, pathParams)
 		return attrs, true, err
 	}
 	return nil, false, nil
 }
 
-func attributesFromEndpointResourceRules(userInfo user.Info, request *http.Request, rules []EndpointResourceRule) ([]authorizer.Attributes, error) {
+func attributesFromEndpointResourceRules(userInfo user.Info, request *http.Request, rules []EndpointResourceRule, pathParams map[string]string) ([]authorizer.Attributes, error) {
 	var attrsOut []authorizer.Attributes
 	for _, rule := range rules {
-		templateData := TemplateData{FromMethod: HTTPToKubeVerb(request.Method)}
+		templateData := TemplateData{FromMethod: HTTPToKubeVerb(request.Method), PathParams: pathParams}
 
 		if rule.Rewrites.ByHTTPHeader != nil && rule.Rewrites.ByHTTPHeader.Name != "" {
 			headerValue := request.Header.Get(rule.Rewrites.ByHTTPHeader.Name)
@@ -323,19 +374,10 @@ func attributesFromEndpointResourceRules(userInfo user.Info, request *http.Reque
 			}
 			templateData.FromQueryString = queryValues[0]
 		}
-		if cfg := rule.Rewrites.ByPathSegment; cfg != nil {
-			value, ok := extractPathSegment(request.URL.Path, cfg.Index)
-			if !ok {
-				return nil, fmt.Errorf("required path segment index %d is missing or empty", cfg.Index)
-			}
-			templateData.FromPathSegment = value
-		}
 		if templateData.FromHeader != "" {
 			templateData.Value = templateData.FromHeader
 		} else if templateData.FromQueryString != "" {
 			templateData.Value = templateData.FromQueryString
-		} else if templateData.FromPathSegment != "" {
-			templateData.Value = templateData.FromPathSegment
 		}
 
 		resAttrs := rule.ResourceAttributes
@@ -394,28 +436,6 @@ func rewriteQueryParamName(rewrites *SubjectAccessReviewRewrites) string {
 	return ""
 }
 
-// extractPathSegment extracts a path segment at the given index after normalizing the path.
-// It returns the segment value and true if the index is valid and the segment is non-empty,
-// or an empty string and false otherwise. The path is cleaned with path.Clean before extraction
-// to normalize repeated slashes, ".", "..", and trailing slashes. The index is 0-based and
-// accounts for the leading "/" producing an empty segment at position 0.
-func extractPathSegment(urlPath string, index int) (string, bool) {
-	if index < 0 {
-		return "", false
-	}
-	segments := strings.Split(path.Clean(urlPath), "/")
-	// +1 to account for the leading "/" which produces an empty segment at index 0
-	idx := index + 1
-	if idx >= len(segments) {
-		return "", false
-	}
-	value := segments[idx]
-	if value == "" {
-		return "", false
-	}
-	return value, true
-}
-
 // CollectRewriteParams gathers rewrite values for Format1 authorization using the same
 // header and query keys as SubjectAccessReviewRewrites.
 func CollectRewriteParams(request *http.Request, rewrites *SubjectAccessReviewRewrites) []string {
@@ -433,12 +453,6 @@ func CollectRewriteParams(request *http.Request, rewrites *SubjectAccessReviewRe
 		headerValues := request.Header.Values(rewrites.ByHTTPHeader.Name)
 		if len(headerValues) > 0 {
 			params = append(params, headerValues...)
-		}
-	}
-
-	if rewrites.ByPathSegment != nil {
-		if value, ok := extractPathSegment(request.URL.Path, rewrites.ByPathSegment.Index); ok {
-			params = append(params, value)
 		}
 	}
 
