@@ -30,11 +30,11 @@ limitations under the License.
 //	    subresource: metrics
 //	    namespace: "{{ .Value }}"
 //
-// Format2 example:
+// Format2 example (wildcard segment):
 //
 //	authorization:
 //	  endpoints:
-//	    - path: /api/v1/tenants/{tenant}/events
+//	    - path: /api/v1/evaluations/jobs/*/events
 //	      mappings:
 //	        - methods: [post]
 //	          resources:
@@ -42,6 +42,27 @@ limitations under the License.
 //	                byHttpHeader:
 //	                  name: X-Tenant
 //	              resourceAttributes:
+//	                namespace: "{{.FromHeader}}"
+//	                apiGroup: trustyai.opendatahub.io
+//	                resource: status-events
+//	                verb: create
+//
+// Format2 example (named path capture):
+//
+// Named captures use {name} segments. Captured values are available in templates
+// via .PathParams, accessed with the standard Go text/template "index" function:
+//
+//	{{ index .PathParams "tenant" }}
+//
+// See https://pkg.go.dev/text/template for the full template syntax reference.
+//
+//	authorization:
+//	  endpoints:
+//	    - path: /api/v1/tenants/{tenant}/events
+//	      mappings:
+//	        - methods: [post]
+//	          resources:
+//	            - resourceAttributes:
 //	                namespace: '{{ index .PathParams "tenant" }}'
 //	                apiGroup: trustyai.opendatahub.io
 //	                resource: status-events
@@ -126,29 +147,18 @@ func (cfg *Config) prepareEndpointPatterns() {
 }
 
 // MatchEndpoint reports whether requestPath matches the configured endpoint pattern.
-// It preserves the original boolean-only API; use MatchEndpointCaptures when named
-// path values are needed.
 // requestPath is cleaned with path.Clean (collapse duplicate slashes, ".", "..", trailing slash)
 // before splitting. Matching is exact by segment count against endpoint.Path (after PrepareEndpoints).
-// A named capture segment such as "{tenant}" matches exactly one request segment;
-// it does not match zero or multiple trailing segments.
-
+// A named capture segment such as "{tenant}" or a wildcard "*" matches exactly one request
+// segment; neither matches zero or multiple trailing segments.
 func MatchEndpoint(requestPath string, endpoint Endpoint) bool {
-	matched, _ := matchEndpoint(requestPath, endpoint)
-	return matched
-}
-
-// MatchEndpointCaptures reports whether requestPath matches and returns values captured
-// by named path segments. A segment such as {tenant} captures one request segment under
-// the key "tenant". The legacy "*" segment matches one request segment but is not captured.
-func MatchEndpointCaptures(requestPath string, endpoint Endpoint) (bool, map[string]string) {
 	return matchEndpoint(requestPath, endpoint)
 }
 
-func matchEndpoint(requestPath string, endpoint Endpoint) (bool, map[string]string) {
+func matchEndpoint(requestPath string, endpoint Endpoint) bool {
 	patternParts := endpoint.PathParts
 	if len(patternParts) == 0 {
-		return false, nil
+		return false
 	}
 	if requestPath == "" {
 		requestPath = "/"
@@ -156,29 +166,39 @@ func matchEndpoint(requestPath string, endpoint Endpoint) (bool, map[string]stri
 	requestPath = path.Clean(requestPath)
 	endpointParts := strings.Split(requestPath, "/")
 	if len(endpointParts) != len(patternParts) {
-		return false, nil
+		return false
 	}
-	captured := map[string]string{}
 	for segmentIndex, patternSegment := range patternParts {
 		if strings.HasPrefix(patternSegment, "{") && strings.HasSuffix(patternSegment, "}") {
-			name := patternSegment[1 : len(patternSegment)-1]
-			if !validPathCaptureName(name) || captured[name] != "" {
-				return false, nil
-			}
-			captured[name] = endpointParts[segmentIndex]
 			continue
 		}
 		if patternSegment == "*" {
 			continue
 		}
 		if strings.ContainsAny(patternSegment, "{}") {
-			return false, nil
+			return false
 		}
 		if endpointParts[segmentIndex] != patternSegment {
-			return false, nil
+			return false
 		}
 	}
-	return true, captured
+	return true
+}
+
+// extractPathCaptures extracts named captures from a request path that has already been
+// confirmed to match the endpoint pattern via matchEndpoint. A segment such as {tenant}
+// captures one request segment under the key "tenant". The legacy "*" segment is not captured.
+func extractPathCaptures(requestPath string, endpoint Endpoint) map[string]string {
+	requestPath = path.Clean(requestPath)
+	endpointParts := strings.Split(requestPath, "/")
+	captured := map[string]string{}
+	for segmentIndex, patternSegment := range endpoint.PathParts {
+		if strings.HasPrefix(patternSegment, "{") && strings.HasSuffix(patternSegment, "}") {
+			name := patternSegment[1 : len(patternSegment)-1]
+			captured[name] = endpointParts[segmentIndex]
+		}
+	}
+	return captured
 }
 
 func validPathCaptureName(name string) bool {
@@ -340,14 +360,14 @@ func EndpointAttributesFromRequest(userInfo user.Info, request *http.Request, cf
 		return nil, false, nil
 	}
 	for _, endpoint := range cfg.Endpoints {
-		matched, pathParams := matchEndpoint(request.URL.Path, endpoint)
-		if !matched {
+		if !matchEndpoint(request.URL.Path, endpoint) {
 			continue
 		}
 		rules, methodOK := rulesForEndpointMethod(request, endpoint)
 		if !methodOK {
 			return nil, true, ErrEndpointMethodNotAllowed
 		}
+		pathParams := extractPathCaptures(request.URL.Path, endpoint)
 		attrs, err := attributesFromEndpointResourceRules(userInfo, request, rules, pathParams)
 		return attrs, true, err
 	}

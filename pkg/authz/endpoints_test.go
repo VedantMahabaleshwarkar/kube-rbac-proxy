@@ -420,13 +420,13 @@ func TestMatchEndpoint_CapturesNamedSegments(t *testing.T) {
 	}
 	for _, c := range cases {
 		ep := Endpoint{Path: c.pattern, PathParts: strings.Split(c.pattern, "/")}
-		matched, captured := MatchEndpointCaptures(c.path, ep)
-		if !matched {
+		if !MatchEndpoint(c.path, ep) {
 			t.Errorf("MatchEndpoint(%q, %q): expected match", c.path, c.pattern)
 			continue
 		}
+		captured := extractPathCaptures(c.path, ep)
 		if !reflect.DeepEqual(captured, c.want) {
-			t.Errorf("MatchEndpoint(%q, %q) captured=%v, want %v", c.path, c.pattern, captured, c.want)
+			t.Errorf("extractPathCaptures(%q, %q) captured=%v, want %v", c.path, c.pattern, captured, c.want)
 		}
 	}
 }
