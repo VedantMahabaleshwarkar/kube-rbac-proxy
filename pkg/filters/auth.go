@@ -67,6 +67,19 @@ func WithAuthorization(
 	cfg *authz.Config,
 	handler http.HandlerFunc,
 ) http.HandlerFunc {
+	return WithAuthorizationAttributesObserver(az, cfg, nil, handler)
+}
+
+// AuthorizationAttributesObserver receives the effective attributes generated
+// for a request before the authorization decision is evaluated.
+type AuthorizationAttributesObserver func(*http.Request, []authorizer.Attributes)
+
+func WithAuthorizationAttributesObserver(
+	az authorizer.Authorizer,
+	cfg *authz.Config,
+	observer AuthorizationAttributesObserver,
+	handler http.HandlerFunc,
+) http.HandlerFunc {
 	getRequestAttributes := proxy.
 		NewKubeRBACProxyAuthorizerAttributesGetter(cfg).
 		GetRequestAttributes
@@ -94,6 +107,9 @@ func WithAuthorization(
 			klog.V(2).Info(authorizationBadRequestBody + " (no attributes generated)")
 			http.Error(w, authorizationBadRequestBody, http.StatusBadRequest)
 			return
+		}
+		if observer != nil {
+			observer(req, allAttrs)
 		}
 
 		for _, attrs := range allAttrs {

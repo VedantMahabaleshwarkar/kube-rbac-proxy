@@ -56,6 +56,11 @@ type ProxyRunOptions struct {
 	QPS   float32
 	Burst int
 
+	AuditLogEnabled      bool
+	AuditISVCName        string
+	AuditISVCNamespace   string
+	AuditUseForwardedFor bool
+
 	flagSet *pflag.FlagSet
 }
 
@@ -137,6 +142,13 @@ func (o *ProxyRunOptions) Flags() k8sapiflag.NamedFlagSets {
 	// HTTP2 flags
 	flagset.Uint32Var(&o.HTTP2MaxConcurrentStreams, "http2-max-concurrent-streams", 100, "The maximum number of concurrent streams per HTTP/2 connection.")
 	flagset.Uint32Var(&o.HTTP2MaxSize, "http2-max-size", 256*1024, "The maximum number of bytes that the server will accept for frame size and buffer per stream in a HTTP/2 request.")
+
+	// Audit flags
+	auditFlagSet := namedFlagSets.FlagSet("audit logging")
+	auditFlagSet.BoolVar(&o.AuditLogEnabled, "audit-log-enabled", false, "Emit OCSF AI inference audit events as JSON lines to stdout for authentication-protected requests.")
+	auditFlagSet.StringVar(&o.AuditISVCName, "audit-isvc-name", "", "InferenceService name to include in audit events. Falls back to authorization resourceAttributes.name.")
+	auditFlagSet.StringVar(&o.AuditISVCNamespace, "audit-isvc-namespace", "", "InferenceService namespace to include in audit events. Falls back to authorization resourceAttributes.namespace.")
+	auditFlagSet.BoolVar(&o.AuditUseForwardedFor, "audit-use-forwarded-for", false, "Trust X-Forwarded-For for audit source addresses. Enable only when the listener is reached through a trusted router.")
 
 	// disabled flags
 	o.addDisabledFlags(flagset)

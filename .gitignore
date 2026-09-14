@@ -5,3 +5,6 @@ manifest-tool
 tmp
 _upstream/
 vendor/
+
+# Agent-generated implementation plans are local workflow artifacts.
+/docs/superpowers/plans/

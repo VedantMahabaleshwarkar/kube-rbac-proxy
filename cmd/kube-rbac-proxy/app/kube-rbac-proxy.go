@@ -41,6 +41,7 @@ import (
 	"golang.org/x/net/http2/h2c"
 
 	"k8s.io/apiserver/pkg/authentication/authenticator"
+	authorizationauthorizer "k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/authorization/union"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -50,10 +51,12 @@ import (
 	"k8s.io/component-base/cli/globalflag"
 	"k8s.io/component-base/logs"
 	"k8s.io/component-base/term"
+	"k8s.io/component-base/version"
 	"k8s.io/component-base/version/verflag"
 	"k8s.io/klog/v2"
 
 	"github.com/brancz/kube-rbac-proxy/cmd/kube-rbac-proxy/app/options"
+	"github.com/brancz/kube-rbac-proxy/pkg/audit"
 	"github.com/brancz/kube-rbac-proxy/pkg/authn"
 	"github.com/brancz/kube-rbac-proxy/pkg/authz"
 	"github.com/brancz/kube-rbac-proxy/pkg/filters"
@@ -145,6 +148,9 @@ type completedProxyRunOptions struct {
 
 	allowPaths  []string
 	ignorePaths []string
+
+	auditLogEnabled bool
+	auditOptions    audit.Options
 }
 
 func Complete(o *options.ProxyRunOptions) (*completedProxyRunOptions, error) {
@@ -197,6 +203,22 @@ func Complete(o *options.ProxyRunOptions) (*completedProxyRunOptions, error) {
 	}
 
 	completed.auth.Authorization.PrepareEndpoints()
+
+	completed.auditLogEnabled = o.AuditLogEnabled
+	completed.auditOptions = audit.Options{
+		Resource: audit.ResourceMetadata{
+			Name:      o.AuditISVCName,
+			Namespace: o.AuditISVCNamespace,
+		},
+		AuthorizationResource: audit.ResolveResourceMetadata(
+			"",
+			"",
+			completed.auth.Authorization.ResourceAttributes,
+		),
+		UseForwardedFor: o.AuditUseForwardedFor,
+		UpstreamURL:     completed.upstreamURL,
+		ProductVersion:  version.Get().GitVersion,
+	}
 
 	kubeconfig, err := initKubeConfig(o.KubeconfigLocation)
 	if err != nil {
@@ -297,45 +319,14 @@ func Run(cfg *completedProxyRunOptions) error {
 		}
 	}
 
-	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		ignorePathFound := false
-		for _, pathIgnored := range cfg.ignorePaths {
-			ignorePathFound, err = path.Match(pathIgnored, req.URL.Path)
-			if err != nil {
-				http.Error(
-					w,
-					http.StatusText(http.StatusInternalServerError),
-					http.StatusInternalServerError,
-				)
-				return
-			}
-			if ignorePathFound {
-				break
-			}
-		}
+	var auditLogger *audit.Logger
+	if cfg.auditLogEnabled {
+		auditLogger = audit.NewLogger(os.Stdout, cfg.auditOptions)
+		defer auditLogger.Close()
+	}
+	protectedHandler := buildProtectedHandler(proxy.ServeHTTP, cfg.auth, authenticator, authorizer, auditLogger)
 
-		// Enforce upstream timeout via request context so it applies for both
-		// http.Transport (ResponseHeaderTimeout) and http2.Transport (e.g. --upstream-force-h2c).
-		proxyReq := req
-		if cfg.upstreamTimeout > 0 {
-			ctx, cancel := context.WithTimeout(req.Context(), cfg.upstreamTimeout)
-			defer cancel()
-			proxyReq = req.WithContext(ctx)
-		}
-
-		if !ignorePathFound {
-			handlerFunc := proxy.ServeHTTP
-			handlerFunc = filters.WithAuthHeaders(cfg.auth.Authentication.Header, handlerFunc)
-			handlerFunc = filters.WithAuthorization(authorizer, cfg.auth.Authorization, handlerFunc)
-			handlerFunc = filters.WithAuthentication(authenticator, cfg.auth.Authentication.Token.Audiences, handlerFunc)
-			handlerFunc(w, proxyReq)
-
-			return
-		}
-
-		proxy.ServeHTTP(w, proxyReq)
-	})
-	handler = filters.WithAllowPaths(cfg.allowPaths, handler)
+	handler := buildRequestHandler(proxy.ServeHTTP, protectedHandler, cfg.allowPaths, cfg.ignorePaths, cfg.upstreamTimeout)
 
 	mux := http.NewServeMux()
 	mux.Handle("/", handler)
@@ -501,6 +492,65 @@ func Run(cfg *completedProxyRunOptions) error {
 	}
 
 	return nil
+}
+
+func buildProtectedHandler(
+	proxyHandler http.HandlerFunc,
+	authConfig *proxy.Config,
+	requestAuthenticator authenticator.Request,
+	requestAuthorizer authorizationauthorizer.Authorizer,
+	auditLogger *audit.Logger,
+) http.HandlerFunc {
+	protectedHandler := filters.WithAuthHeaders(authConfig.Authentication.Header, proxyHandler)
+	if auditLogger == nil {
+		protectedHandler = filters.WithAuthorization(requestAuthorizer, authConfig.Authorization, protectedHandler)
+		return filters.WithAuthentication(requestAuthenticator, authConfig.Authentication.Token.Audiences, protectedHandler)
+	}
+
+	protectedHandler = filters.WithAuthorizationAttributesObserver(
+		requestAuthorizer,
+		authConfig.Authorization,
+		auditLogger.CaptureAuthorizationAttributes,
+		protectedHandler,
+	)
+	protectedHandler = auditLogger.CaptureUser(protectedHandler)
+	protectedHandler = filters.WithAuthentication(requestAuthenticator, authConfig.Authentication.Token.Audiences, protectedHandler)
+	return auditLogger.WithAuditLog(protectedHandler)
+}
+
+func buildRequestHandler(proxyHandler, protectedHandler http.HandlerFunc, allowPaths, ignorePaths []string, upstreamTimeout time.Duration) http.HandlerFunc {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		ignorePathFound := false
+		for _, pathIgnored := range ignorePaths {
+			var err error
+			ignorePathFound, err = path.Match(pathIgnored, req.URL.Path)
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			if ignorePathFound {
+				break
+			}
+		}
+
+		// Enforce upstream timeout via request context so it applies for both
+		// http.Transport (ResponseHeaderTimeout) and http2.Transport (e.g. --upstream-force-h2c).
+		proxyReq := req
+		if upstreamTimeout > 0 {
+			ctx, cancel := context.WithTimeout(req.Context(), upstreamTimeout)
+			defer cancel()
+			proxyReq = req.WithContext(ctx)
+		}
+
+		if !ignorePathFound {
+			protectedHandler(w, proxyReq)
+			return
+		}
+
+		proxyHandler.ServeHTTP(w, proxyReq)
+	})
+
+	return filters.WithAllowPaths(allowPaths, handler)
 }
 
 // Returns intiliazed config, allows local usage (outside cluster) based on provided kubeconfig or in-cluter

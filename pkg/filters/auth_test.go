@@ -248,6 +248,44 @@ func TestWithAuthorization(t *testing.T) {
 	}
 }
 
+func TestAuthorizationAttributesObserverReceivesResolvedValues(t *testing.T) {
+	cfg := &authz.Config{
+		Rewrites: &authz.SubjectAccessReviewRewrites{
+			ByQueryParameter: &authz.QueryParameterRewriteConfig{Name: "isvc"},
+		},
+		ResourceAttributes: &authz.ResourceAttributes{
+			Name:      "{{ .Value }}",
+			Namespace: "models",
+			Resource:  "inferenceservices",
+			Verb:      "get",
+		},
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/infer?isvc=fraud-detector", nil)
+	req = req.WithContext(request.WithUser(req.Context(), &user.DefaultInfo{Name: "alice"}))
+
+	var observed []authorizer.Attributes
+	handler := filters.WithAuthorizationAttributesObserver(
+		authorizerFunc(func(context.Context, authorizer.Attributes) (authorizer.Decision, string, error) {
+			return authorizer.DecisionAllow, "", nil
+		}),
+		cfg,
+		func(_ *http.Request, attrs []authorizer.Attributes) { observed = attrs },
+		func(http.ResponseWriter, *http.Request) {},
+	)
+	recorder := httptest.NewRecorder()
+	handler(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	if len(observed) != 1 {
+		t.Fatalf("observed %d authorization attributes, want 1", len(observed))
+	}
+	if observed[0].GetName() != "fraud-detector" || observed[0].GetNamespace() != "models" {
+		t.Fatalf("observed resource = %s/%s, want models/fraud-detector", observed[0].GetNamespace(), observed[0].GetName())
+	}
+}
+
 type authorizerFunc func(context.Context, authorizer.Attributes) (authorizer.Decision, string, error)
 
 func (a authorizerFunc) Authorize(ctx context.Context, attr authorizer.Attributes) (authorizer.Decision, string, error) {
