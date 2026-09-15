@@ -16,14 +16,19 @@ limitations under the License.
 
 package options
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"github.com/brancz/kube-rbac-proxy/pkg/audit"
+)
 
 func TestAuditFlags(t *testing.T) {
 	o := NewProxyRunOptions()
 	flagSets := o.Flags()
 	flagSet := flagSets.FlagSet("audit logging")
 	for _, name := range []string{
-		"audit-log-enabled",
+		"audit-log-profile",
 		"audit-resource-name",
 		"audit-resource-namespace",
 		"audit-resource-type",
@@ -35,18 +40,18 @@ func TestAuditFlags(t *testing.T) {
 		}
 	}
 
-	for _, name := range []string{"audit-isvc-name", "audit-isvc-namespace"} {
+	for _, name := range []string{"audit-log-enabled", "audit-isvc-name", "audit-isvc-namespace"} {
 		if flagSet.Lookup(name) != nil {
 			t.Fatalf("legacy flag --%s must not be registered", name)
 		}
 	}
 
-	if o.AuditLogEnabled || o.AuditUseForwardedFor || o.AuditResourceName != "" || o.AuditResourceNamespace != "" || o.AuditResourceType != "" || o.AuditAIProvider != "" {
+	if o.AuditLogProfile != audit.ProfileNone || o.AuditUseForwardedFor || o.AuditResourceName != "" || o.AuditResourceNamespace != "" || o.AuditResourceType != "" || o.AuditAIProvider != "" {
 		t.Fatalf("unexpected audit defaults: %+v", o)
 	}
 
 	if err := flagSet.Parse([]string{
-		"--audit-log-enabled",
+		"--audit-log-profile=metadata",
 		"--audit-resource-name=model",
 		"--audit-resource-namespace=models",
 		"--audit-resource-type=InferenceService",
@@ -55,7 +60,17 @@ func TestAuditFlags(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !o.AuditLogEnabled || !o.AuditUseForwardedFor || o.AuditResourceName != "model" || o.AuditResourceNamespace != "models" || o.AuditResourceType != "InferenceService" || o.AuditAIProvider != "KServe" {
+	if o.AuditLogProfile != audit.ProfileMetadata || !o.AuditUseForwardedFor || o.AuditResourceName != "model" || o.AuditResourceNamespace != "models" || o.AuditResourceType != "InferenceService" || o.AuditAIProvider != "KServe" {
 		t.Fatalf("audit flags were not parsed: %+v", o)
+	}
+}
+
+func TestAuditLogProfileFlagRejectsUnimplementedProfile(t *testing.T) {
+	o := NewProxyRunOptions()
+	flagSets := o.Flags()
+	flagSet := flagSets.FlagSet("audit logging")
+	err := flagSet.Set("audit-log-profile", "request")
+	if err == nil || !strings.Contains(err.Error(), `must be one of "none" or "metadata"`) {
+		t.Fatalf("Parse(request) error = %v, want supported-profile error", err)
 	}
 }

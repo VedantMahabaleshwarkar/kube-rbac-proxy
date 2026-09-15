@@ -94,7 +94,7 @@ Kube-rbac-proxy flags:
 Audit logging flags:
 
       --audit-ai-provider string          AI provider to include in audit events when a resource name is resolved.
-      --audit-log-enabled                 Emit OCSF AI inference audit events as JSON lines to stdout for authentication-protected requests.
+      --audit-log-profile string          Audit logging profile. Supported values are "none" (disabled) and "metadata" (request and response metadata without bodies). (default "none")
       --audit-resource-name string        Resource name to include in audit events. Falls back to authorization resourceAttributes.name.
       --audit-resource-namespace string   Resource namespace to include in audit events. Falls back to authorization resourceAttributes.namespace.
       --audit-resource-type string        OCSF resource type to include in audit events.
@@ -108,11 +108,11 @@ Global flags:
 
 ### AI inference audit logging
 
-Set `--audit-log-enabled` to emit one [OCSF 1.9.0 API Activity](https://github.com/ocsf/ocsf-schema/blob/v1.9.0/events/application/api_activity.json) event with the `ai_operation` profile per authentication-protected request. Audit records are written as JSON lines to stdout; operational logs remain on stderr. Requests matching `--ignore-paths`, requests rejected by `--allow-paths`, and the separate proxy health endpoint are not audited.
+Set `--audit-log-profile=metadata` to emit one [OCSF 1.9.0 API Activity](https://github.com/ocsf/ocsf-schema/blob/v1.9.0/events/application/api_activity.json) event with the OCSF `ai_operation` profile per authentication-protected request. The default `--audit-log-profile=none` emits no audit events. These logging-profile values are kube-rbac-proxy configuration and do not replace the OCSF profile recorded inside each event. Audit records are written as JSON lines to stdout; operational logs remain on stderr. Requests matching `--ignore-paths`, requests rejected by `--allow-paths`, and the separate proxy health endpoint are not audited.
 
 Resource name and namespace are resolved independently. For each field, an explicit `--audit-resource-name` or `--audit-resource-namespace` value takes precedence, followed by the request-specific value resolved from `authorization.resourceAttributes`, and finally by the corresponding static `authorization.resourceAttributes` value when it does not contain a template delimiter. Missing metadata does not prevent the proxy from starting or emitting a request event. `--audit-resource-type` is optional and is included only when configured; it is not inferred from the Kubernetes resource attribute.
 
-For example, a KServe sidecar can identify its target with `--audit-resource-name=<name>`, `--audit-resource-namespace=<namespace>`, `--audit-resource-type=InferenceService`, and `--audit-ai-provider=KServe`. The OCSF `ai_model` field is emitted only when a resource name is resolved and `--audit-ai-provider` is nonempty.
+For example, a KServe sidecar can use `--audit-log-profile=metadata` and identify its target with `--audit-resource-name=<name>`, `--audit-resource-namespace=<namespace>`, `--audit-resource-type=InferenceService`, and `--audit-ai-provider=KServe`. The OCSF `ai_model` field is emitted only when a resource name is resolved and `--audit-ai-provider` is nonempty.
 
 The event records the authenticated Kubernetes principal name, UID, and groups literally. Treat audit output as sensitive identity data and restrict access to stdout collection, storage, and downstream audit systems with appropriate access controls.
 

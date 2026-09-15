@@ -25,6 +25,7 @@ import (
 	k8sapiflag "k8s.io/component-base/cli/flag"
 	"k8s.io/klog/v2"
 
+	"github.com/brancz/kube-rbac-proxy/pkg/audit"
 	"github.com/brancz/kube-rbac-proxy/pkg/authn"
 	"github.com/brancz/kube-rbac-proxy/pkg/authz"
 	"github.com/brancz/kube-rbac-proxy/pkg/proxy"
@@ -56,7 +57,7 @@ type ProxyRunOptions struct {
 	QPS   float32
 	Burst int
 
-	AuditLogEnabled        bool
+	AuditLogProfile        audit.Profile
 	AuditResourceName      string
 	AuditResourceNamespace string
 	AuditResourceType      string
@@ -89,7 +90,8 @@ func NewProxyRunOptions() *ProxyRunOptions {
 			},
 			Authorization: &authz.Config{},
 		},
-		TLS: &TLSConfig{},
+		TLS:             &TLSConfig{},
+		AuditLogProfile: audit.ProfileNone,
 	}
 }
 
@@ -147,7 +149,7 @@ func (o *ProxyRunOptions) Flags() k8sapiflag.NamedFlagSets {
 
 	// Audit flags
 	auditFlagSet := namedFlagSets.FlagSet("audit logging")
-	auditFlagSet.BoolVar(&o.AuditLogEnabled, "audit-log-enabled", false, "Emit OCSF AI inference audit events as JSON lines to stdout for authentication-protected requests.")
+	auditFlagSet.Var(&o.AuditLogProfile, "audit-log-profile", `Audit logging profile. Supported values are "none" (disabled) and "metadata" (request and response metadata without bodies).`)
 	auditFlagSet.StringVar(&o.AuditResourceName, "audit-resource-name", "", "Resource name to include in audit events. Falls back to authorization resourceAttributes.name.")
 	auditFlagSet.StringVar(&o.AuditResourceNamespace, "audit-resource-namespace", "", "Resource namespace to include in audit events. Falls back to authorization resourceAttributes.namespace.")
 	auditFlagSet.StringVar(&o.AuditResourceType, "audit-resource-type", "", "OCSF resource type to include in audit events.")
@@ -198,6 +200,10 @@ For more information, please go to https://github.com/brancz/kube-rbac-proxy/iss
 
 	if len(o.AllowPaths) > 0 && len(o.IgnorePaths) > 0 {
 		errs = append(errs, fmt.Errorf("cannot use --allow-paths and --ignore-paths together"))
+	}
+
+	if err := o.AuditLogProfile.Validate(); err != nil {
+		errs = append(errs, err)
 	}
 
 	for _, pathAllowed := range o.AllowPaths {

@@ -146,7 +146,7 @@ func TestCompleteBuildsAuditOptions(t *testing.T) {
 			o := options.NewProxyRunOptions()
 			o.KubeconfigLocation = kubeconfigPath
 			o.Upstream = "https://upstream.example.test:8443/v1"
-			o.AuditLogEnabled = true
+			o.AuditLogProfile = audit.ProfileMetadata
 			o.AuditResourceName = "explicit-model"
 			o.AuditResourceNamespace = "explicit-namespace"
 			o.AuditResourceType = "InferenceService"
@@ -159,8 +159,8 @@ func TestCompleteBuildsAuditOptions(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Complete() error: %v", err)
 			}
-			if !completed.auditLogEnabled {
-				t.Fatal("auditLogEnabled = false, want true")
+			if completed.auditLogProfile != audit.ProfileMetadata {
+				t.Fatalf("auditLogProfile = %q, want %q", completed.auditLogProfile, audit.ProfileMetadata)
 			}
 			if completed.kubeClient == nil {
 				t.Fatal("kubeClient = nil, want client constructed without a live request")
@@ -196,7 +196,7 @@ func TestCommandExposesAuditFlags(t *testing.T) {
 	sort.Strings(got)
 	want := []string{
 		"audit-ai-provider",
-		"audit-log-enabled",
+		"audit-log-profile",
 		"audit-resource-name",
 		"audit-resource-namespace",
 		"audit-resource-type",
@@ -205,10 +205,37 @@ func TestCommandExposesAuditFlags(t *testing.T) {
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("audit flags mismatch (-want +got):\n%s", diff)
 	}
-	for _, oldName := range []string{"audit-isvc-name", "audit-isvc-namespace"} {
+	for _, oldName := range []string{"audit-log-enabled", "audit-isvc-name", "audit-isvc-namespace"} {
 		if cmd.Flags().Lookup(oldName) != nil {
 			t.Errorf("obsolete flag %q is still registered", oldName)
 		}
+	}
+}
+
+func TestNewAuditLoggerSelectsImplementedProfile(t *testing.T) {
+	tests := []struct {
+		name       string
+		profile    audit.Profile
+		wantLogger bool
+		wantErr    bool
+	}{
+		{name: "none", profile: audit.ProfileNone},
+		{name: "metadata", profile: audit.ProfileMetadata, wantLogger: true},
+		{name: "unimplemented", profile: audit.Profile("request"), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger, err := newAuditLogger(tt.profile, io.Discard, audit.Options{})
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("newAuditLogger() error = %v, wantErr %t", err, tt.wantErr)
+			}
+			if (logger != nil) != tt.wantLogger {
+				t.Fatalf("newAuditLogger() logger present = %t, want %t", logger != nil, tt.wantLogger)
+			}
+			if logger != nil {
+				closeAuditLogger(t, logger)
+			}
+		})
 	}
 }
 
@@ -411,7 +438,7 @@ func TestBuildRequestHandlerAuditBoundaries(t *testing.T) {
 		path          string
 		allowPaths    []string
 		ignorePaths   []string
-		auditEnabled  bool
+		auditProfile  audit.Profile
 		wantStatus    int
 		wantEvents    int
 		wantDirect    bool
@@ -420,7 +447,7 @@ func TestBuildRequestHandlerAuditBoundaries(t *testing.T) {
 		{
 			name:          "protected request is audited",
 			path:          "/infer",
-			auditEnabled:  true,
+			auditProfile:  audit.ProfileMetadata,
 			wantStatus:    http.StatusAccepted,
 			wantEvents:    1,
 			wantProtected: true,
@@ -428,6 +455,7 @@ func TestBuildRequestHandlerAuditBoundaries(t *testing.T) {
 		{
 			name:          "auditing disabled produces no output",
 			path:          "/infer",
+			auditProfile:  audit.ProfileNone,
 			wantStatus:    http.StatusAccepted,
 			wantProtected: true,
 		},
@@ -435,7 +463,7 @@ func TestBuildRequestHandlerAuditBoundaries(t *testing.T) {
 			name:         "ignored request bypasses audit",
 			path:         "/metrics",
 			ignorePaths:  []string{"/metrics"},
-			auditEnabled: true,
+			auditProfile: audit.ProfileMetadata,
 			wantStatus:   http.StatusNoContent,
 			wantDirect:   true,
 		},
@@ -443,7 +471,7 @@ func TestBuildRequestHandlerAuditBoundaries(t *testing.T) {
 			name:         "allow path rejection happens before audit",
 			path:         "/blocked",
 			allowPaths:   []string{"/infer"},
-			auditEnabled: true,
+			auditProfile: audit.ProfileMetadata,
 			wantStatus:   http.StatusNotFound,
 		},
 	}
@@ -451,7 +479,7 @@ func TestBuildRequestHandlerAuditBoundaries(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var output bytes.Buffer
-			auditLogger := audit.NewLogger(&output, audit.Options{
+			auditLogger, err := newAuditLogger(tt.auditProfile, &output, audit.Options{
 				Resource: audit.ResourceMetadata{
 					Name:      "route-model",
 					Namespace: "route-namespace",
@@ -459,12 +487,15 @@ func TestBuildRequestHandlerAuditBoundaries(t *testing.T) {
 				},
 				ProductVersion: "test",
 			})
+			if err != nil {
+				t.Fatalf("newAuditLogger() error: %v", err)
+			}
 			protectedCalled := false
 			protected := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				protectedCalled = true
 				w.WriteHeader(http.StatusAccepted)
 			})
-			if tt.auditEnabled {
+			if auditLogger != nil {
 				protected = auditLogger.WithAuditLog(protected)
 			}
 			directCalled := false
@@ -478,7 +509,9 @@ func TestBuildRequestHandlerAuditBoundaries(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, tt.path, nil)
 			req.RemoteAddr = "192.0.2.1:1234"
 			handler(recorder, req)
-			closeAuditLogger(t, auditLogger)
+			if auditLogger != nil {
+				closeAuditLogger(t, auditLogger)
+			}
 
 			if recorder.Code != tt.wantStatus {
 				t.Errorf("status = %d, want %d", recorder.Code, tt.wantStatus)
@@ -527,7 +560,7 @@ func TestBuildRequestHandlerAuditBoundaries(t *testing.T) {
 func TestBuildProtectedHandlerAuditsFullChain(t *testing.T) {
 	tests := []struct {
 		name           string
-		auditEnabled   bool
+		auditProfile   audit.Profile
 		authenticated  bool
 		decision       authorizer.Decision
 		wantStatus     int
@@ -540,7 +573,7 @@ func TestBuildProtectedHandlerAuditsFullChain(t *testing.T) {
 	}{
 		{
 			name:           "authorized request reaches upstream",
-			auditEnabled:   true,
+			auditProfile:   audit.ProfileMetadata,
 			authenticated:  true,
 			decision:       authorizer.DecisionAllow,
 			wantStatus:     http.StatusOK,
@@ -553,7 +586,7 @@ func TestBuildProtectedHandlerAuditsFullChain(t *testing.T) {
 		},
 		{
 			name:           "authentication failure",
-			auditEnabled:   true,
+			auditProfile:   audit.ProfileMetadata,
 			wantStatus:     http.StatusUnauthorized,
 			wantEvents:     1,
 			wantAuditUser:  audit.User{Name: "Unknown", TypeID: 0},
@@ -562,7 +595,7 @@ func TestBuildProtectedHandlerAuditsFullChain(t *testing.T) {
 		},
 		{
 			name:           "authorization denial retains observed resource",
-			auditEnabled:   true,
+			auditProfile:   audit.ProfileMetadata,
 			authenticated:  true,
 			decision:       authorizer.DecisionDeny,
 			wantStatus:     http.StatusForbidden,
@@ -574,6 +607,7 @@ func TestBuildProtectedHandlerAuditsFullChain(t *testing.T) {
 		},
 		{
 			name:          "auditing disabled",
+			auditProfile:  audit.ProfileNone,
 			authenticated: true,
 			decision:      authorizer.DecisionAllow,
 			wantStatus:    http.StatusOK,
@@ -584,12 +618,12 @@ func TestBuildProtectedHandlerAuditsFullChain(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var output bytes.Buffer
-			var auditLogger *audit.Logger
-			if tt.auditEnabled {
-				// Deliberately omit explicit and static fallback metadata. In the
-				// denial case, any emitted resource must have been observed before
-				// the authorizer rejected the request.
-				auditLogger = audit.NewLogger(&output, audit.Options{ProductVersion: "test"})
+			// Deliberately omit explicit and static fallback metadata. In the
+			// denial case, any emitted resource must have been observed before
+			// the authorizer rejected the request.
+			auditLogger, err := newAuditLogger(tt.auditProfile, &output, audit.Options{ProductVersion: "test"})
+			if err != nil {
+				t.Fatalf("newAuditLogger() error: %v", err)
 			}
 			requestAuthenticator := authenticator.RequestFunc(func(*http.Request) (*authenticator.Response, bool, error) {
 				if !tt.authenticated {

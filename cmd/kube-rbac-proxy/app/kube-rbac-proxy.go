@@ -22,6 +22,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -151,7 +152,7 @@ type completedProxyRunOptions struct {
 	allowPaths  []string
 	ignorePaths []string
 
-	auditLogEnabled bool
+	auditLogProfile audit.Profile
 	auditOptions    audit.Options
 }
 
@@ -206,7 +207,7 @@ func Complete(o *options.ProxyRunOptions) (*completedProxyRunOptions, error) {
 
 	completed.auth.Authorization.PrepareEndpoints()
 
-	completed.auditLogEnabled = o.AuditLogEnabled
+	completed.auditLogProfile = o.AuditLogProfile
 	completed.auditOptions = audit.Options{
 		Resource: audit.ResourceMetadata{
 			Name:      o.AuditResourceName,
@@ -320,9 +321,11 @@ func Run(cfg *completedProxyRunOptions) error {
 		proxy.Transport = withResponseHeaderTimeout(h2cTransport, cfg.upstreamTimeout)
 	}
 
-	var auditLogger *audit.Logger
-	if cfg.auditLogEnabled {
-		auditLogger = audit.NewLogger(os.Stdout, cfg.auditOptions)
+	auditLogger, err := newAuditLogger(cfg.auditLogProfile, os.Stdout, cfg.auditOptions)
+	if err != nil {
+		return fmt.Errorf("failed to configure audit logger: %w", err)
+	}
+	if auditLogger != nil {
 		defer func() {
 			ctx, cancel := context.WithTimeout(context.Background(), auditShutdownTimeout)
 			defer cancel()
@@ -499,6 +502,20 @@ func Run(cfg *completedProxyRunOptions) error {
 	}
 
 	return nil
+}
+
+func newAuditLogger(profile audit.Profile, output io.Writer, options audit.Options) (*audit.Logger, error) {
+	if err := profile.Validate(); err != nil {
+		return nil, err
+	}
+	switch profile {
+	case audit.ProfileNone:
+		return nil, nil
+	case audit.ProfileMetadata:
+		return audit.NewLogger(output, options), nil
+	default:
+		return nil, fmt.Errorf("audit log profile %q has no logger implementation", profile)
+	}
 }
 
 func buildProtectedHandler(
