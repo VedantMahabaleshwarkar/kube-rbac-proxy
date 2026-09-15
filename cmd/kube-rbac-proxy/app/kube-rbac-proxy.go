@@ -65,6 +65,8 @@ import (
 	rbac_proxy_tls "github.com/brancz/kube-rbac-proxy/pkg/tls"
 )
 
+const auditShutdownTimeout = 5 * time.Second
+
 func NewKubeRBACProxyCommand() *cobra.Command {
 	o := options.NewProxyRunOptions()
 	cmd := &cobra.Command{
@@ -207,17 +209,15 @@ func Complete(o *options.ProxyRunOptions) (*completedProxyRunOptions, error) {
 	completed.auditLogEnabled = o.AuditLogEnabled
 	completed.auditOptions = audit.Options{
 		Resource: audit.ResourceMetadata{
-			Name:      o.AuditISVCName,
-			Namespace: o.AuditISVCNamespace,
+			Name:      o.AuditResourceName,
+			Namespace: o.AuditResourceNamespace,
+			Type:      o.AuditResourceType,
 		},
-		AuthorizationResource: audit.ResolveResourceMetadata(
-			"",
-			"",
-			completed.auth.Authorization.ResourceAttributes,
-		),
-		UseForwardedFor: o.AuditUseForwardedFor,
-		UpstreamURL:     completed.upstreamURL,
-		ProductVersion:  version.Get().GitVersion,
+		AuthorizationResource: audit.StaticResourceMetadata(completed.auth.Authorization.ResourceAttributes),
+		AIProvider:            o.AuditAIProvider,
+		UseForwardedFor:       o.AuditUseForwardedFor,
+		UpstreamURL:           completed.upstreamURL,
+		ProductVersion:        version.Get().GitVersion,
 	}
 
 	kubeconfig, err := initKubeConfig(o.KubeconfigLocation)
@@ -308,7 +308,7 @@ func Run(cfg *completedProxyRunOptions) error {
 		// Force http/2 for connections to the upstream i.e. do not start with HTTP1.1 UPGRADE req to
 		// initialize http/2 session.
 		// See https://github.com/golang/go/issues/14141#issuecomment-219212895 for more context
-		proxy.Transport = &http2.Transport{
+		h2cTransport := &http2.Transport{
 			// Allow http schema. This doesn't automatically disable TLS
 			AllowHTTP: true,
 			// Do disable TLS.
@@ -317,16 +317,23 @@ func Run(cfg *completedProxyRunOptions) error {
 				return (&net.Dialer{}).DialContext(ctx, netw, addr)
 			},
 		}
+		proxy.Transport = withResponseHeaderTimeout(h2cTransport, cfg.upstreamTimeout)
 	}
 
 	var auditLogger *audit.Logger
 	if cfg.auditLogEnabled {
 		auditLogger = audit.NewLogger(os.Stdout, cfg.auditOptions)
-		defer auditLogger.Close()
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), auditShutdownTimeout)
+			defer cancel()
+			if err := auditLogger.Close(ctx); err != nil {
+				klog.Errorf("failed to flush audit log during shutdown: %+v", err)
+			}
+		}()
 	}
 	protectedHandler := buildProtectedHandler(proxy.ServeHTTP, cfg.auth, authenticator, authorizer, auditLogger)
 
-	handler := buildRequestHandler(proxy.ServeHTTP, protectedHandler, cfg.allowPaths, cfg.ignorePaths, cfg.upstreamTimeout)
+	handler := buildRequestHandler(proxy.ServeHTTP, protectedHandler, cfg.allowPaths, cfg.ignorePaths)
 
 	mux := http.NewServeMux()
 	mux.Handle("/", handler)
@@ -518,7 +525,7 @@ func buildProtectedHandler(
 	return auditLogger.WithAuditLog(protectedHandler)
 }
 
-func buildRequestHandler(proxyHandler, protectedHandler http.HandlerFunc, allowPaths, ignorePaths []string, upstreamTimeout time.Duration) http.HandlerFunc {
+func buildRequestHandler(proxyHandler, protectedHandler http.HandlerFunc, allowPaths, ignorePaths []string) http.HandlerFunc {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		ignorePathFound := false
 		for _, pathIgnored := range ignorePaths {
@@ -533,21 +540,12 @@ func buildRequestHandler(proxyHandler, protectedHandler http.HandlerFunc, allowP
 			}
 		}
 
-		// Enforce upstream timeout via request context so it applies for both
-		// http.Transport (ResponseHeaderTimeout) and http2.Transport (e.g. --upstream-force-h2c).
-		proxyReq := req
-		if upstreamTimeout > 0 {
-			ctx, cancel := context.WithTimeout(req.Context(), upstreamTimeout)
-			defer cancel()
-			proxyReq = req.WithContext(ctx)
-		}
-
 		if !ignorePathFound {
-			protectedHandler(w, proxyReq)
+			protectedHandler(w, req)
 			return
 		}
 
-		proxyHandler.ServeHTTP(w, proxyReq)
+		proxyHandler.ServeHTTP(w, req)
 	})
 
 	return filters.WithAllowPaths(allowPaths, handler)

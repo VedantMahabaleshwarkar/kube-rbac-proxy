@@ -18,6 +18,7 @@ package audit
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,6 +42,15 @@ import (
 	"github.com/brancz/kube-rbac-proxy/pkg/authz"
 )
 
+func closeLogger(t *testing.T, logger *Logger) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := logger.Close(ctx); err != nil {
+		t.Fatalf("close audit logger: %v", err)
+	}
+}
+
 func TestEventContract(t *testing.T) {
 	upstream, err := url.Parse("https://[2001:db8::20]:9443")
 	if err != nil {
@@ -50,12 +60,14 @@ func TestEventContract(t *testing.T) {
 		Resource: ResourceMetadata{
 			Name:      "fraud-detector",
 			Namespace: "models",
+			Type:      "InferenceService",
 		},
+		AIProvider:      "KServe",
 		UseForwardedFor: true,
 		UpstreamURL:     upstream,
 		ProductVersion:  "v0.21.0",
 	})
-	t.Cleanup(logger.Close)
+	t.Cleanup(func() { closeLogger(t, logger) })
 	req := httptest.NewRequest(http.MethodPost, "https://proxy.example/v1/models/fraud:predict?tenant=private", strings.NewReader("prompt-secret"))
 	req.Proto = "HTTP/2.0"
 	req.RemoteAddr = "192.0.2.10:43120"
@@ -219,7 +231,7 @@ func TestMiddlewareStatusIdentityAndStreaming(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/models/model:predict", nil)
 			req.RemoteAddr = "192.0.2.1:1234"
 			handler(recorder, req)
-			logger.Close()
+			closeLogger(t, logger)
 
 			var event Event
 			if err := json.NewDecoder(&output).Decode(&event); err != nil {
@@ -261,7 +273,7 @@ func TestSensitiveValuesAreNotLogged(t *testing.T) {
 	req.Header.Set("Cookie", "session=cookie-secret")
 	req.Header.Set("X-Custom-Secret", "header-secret")
 	handler(httptest.NewRecorder(), req)
-	logger.Close()
+	closeLogger(t, logger)
 
 	logLine := output.String()
 	for _, secret := range []string{"query-secret", "prompt-secret", "response-secret", "bearer-secret", "cookie-secret", "header-secret"} {
@@ -278,7 +290,7 @@ func TestSensitiveValuesAreNotLogged(t *testing.T) {
 
 func TestUnavailableOptionalFieldsAreOmitted(t *testing.T) {
 	logger := NewLogger(io.Discard, Options{ProductVersion: "test"})
-	t.Cleanup(logger.Close)
+	t.Cleanup(func() { closeLogger(t, logger) })
 	req := httptest.NewRequest(http.MethodGet, "http://proxy/infer", nil)
 	req.RemoteAddr = "not-an-address"
 	event := logger.event(req, &requestContext{}, httpsnoop.Metrics{Code: 401}, time.Unix(1, 0))
@@ -319,7 +331,7 @@ func TestConcurrentJSONLinesDoNotInterleave(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	logger.Close()
+	closeLogger(t, logger)
 
 	decoder := json.NewDecoder(&output)
 	count := 0
@@ -354,7 +366,7 @@ func TestOversizedAuditEventIsDroppedBeforeQueueing(t *testing.T) {
 	normalReq := httptest.NewRequest(http.MethodPost, "http://proxy/infer", nil)
 	normalReq.RemoteAddr = "192.0.2.3:8080"
 	handler(httptest.NewRecorder(), normalReq)
-	logger.Close()
+	closeLogger(t, logger)
 
 	if got := logger.dropped.Load(); got != 1 {
 		t.Fatalf("dropped events = %d, want 1", got)
@@ -388,7 +400,7 @@ func TestAuditWriteFailureDoesNotChangeResponse(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "http://proxy/infer", nil)
 	req.RemoteAddr = "192.0.2.4:8080"
 	handler(recorder, req)
-	logger.Close()
+	closeLogger(t, logger)
 
 	if recorder.Code != http.StatusAccepted || recorder.Body.String() != "accepted" {
 		t.Fatalf("response changed after audit failure: code=%d body=%q", recorder.Code, recorder.Body.String())
@@ -409,7 +421,7 @@ func TestPanickingHandlerIsAuditedAndPanicPropagates(t *testing.T) {
 		defer func() { recovered = recover() }()
 		handler(httptest.NewRecorder(), req)
 	}()
-	logger.Close()
+	closeLogger(t, logger)
 
 	if recovered != "handler failed" {
 		t.Fatalf("recovered panic = %v, want handler failed", recovered)
@@ -439,7 +451,7 @@ func TestPanickingHandlerPreservesCommittedResponseCode(t *testing.T) {
 		defer func() { recovered = recover() }()
 		handler(recorder, req)
 	}()
-	logger.Close()
+	closeLogger(t, logger)
 
 	if recovered != "handler failed after response" {
 		t.Fatalf("recovered panic = %v, want handler failed after response", recovered)
@@ -480,7 +492,7 @@ func TestPanickingHandlerPreservesImplicitResponseCodeAfterEmptyWrite(t *testing
 		defer func() { recovered = recover() }()
 		handler(recorder, req)
 	}()
-	logger.Close()
+	closeLogger(t, logger)
 
 	if recovered != "handler failed after empty write" {
 		t.Fatalf("recovered panic = %v, want handler failed after empty write", recovered)
@@ -506,7 +518,7 @@ func TestPanickingHandlerPreservesImplicitResponseCodeAfterEmptyWrite(t *testing
 func TestRequestSpecificResourceMetadata(t *testing.T) {
 	var output bytes.Buffer
 	logger := NewLogger(&output, Options{
-		Resource:              ResourceMetadata{Namespace: "flag-namespace"},
+		Resource:              ResourceMetadata{Namespace: "flag-namespace", Type: "InferenceService"},
 		AuthorizationResource: ResourceMetadata{Name: "static-name", Namespace: "static-namespace"},
 		ProductVersion:        "test",
 	})
@@ -521,7 +533,7 @@ func TestRequestSpecificResourceMetadata(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "http://proxy/infer", nil)
 	req.RemoteAddr = "192.0.2.6:8080"
 	handler(httptest.NewRecorder(), req)
-	logger.Close()
+	closeLogger(t, logger)
 
 	var event Event
 	if err := json.NewDecoder(&output).Decode(&event); err != nil {
@@ -554,6 +566,107 @@ func (w *blockingWriter) Write(p []byte) (int, error) {
 
 func (w *blockingWriter) Bytes() []byte {
 	return w.buffer.Bytes()
+}
+
+func TestLoggerCloseDrainsQueuedEvents(t *testing.T) {
+	var output bytes.Buffer
+	logger := newLogger(&output, Options{ProductVersion: "test"}, 4)
+	handler := logger.WithAuditLog(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("http://proxy/infer/%d", i), nil)
+		req.RemoteAddr = "192.0.2.7:8080"
+		handler(httptest.NewRecorder(), req)
+	}
+	closeLogger(t, logger)
+
+	decoder := json.NewDecoder(&output)
+	for i := 0; i < 3; i++ {
+		var event Event
+		if err := decoder.Decode(&event); err != nil {
+			t.Fatalf("decode audit event %d: %v", i, err)
+		}
+		wantPath := fmt.Sprintf("/infer/%d", i)
+		if event.HTTPRequest.URL.Path != wantPath {
+			t.Errorf("audit path = %q, want %q", event.HTTPRequest.URL.Path, wantPath)
+		}
+	}
+	if err := decoder.Decode(&Event{}); err != io.EOF {
+		t.Fatalf("expected exactly three audit events, got trailing decode error %v", err)
+	}
+}
+
+func TestLoggerCloseIsSafeWhenRepeatedAndConcurrent(t *testing.T) {
+	logger := NewLogger(io.Discard, Options{ProductVersion: "test"})
+
+	const closers = 20
+	start := make(chan struct{})
+	errs := make(chan error, closers)
+	var wg sync.WaitGroup
+	for i := 0; i < closers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			errs <- logger.Close(ctx)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent Close returned error: %v", err)
+		}
+	}
+	closeLogger(t, logger)
+}
+
+func TestLoggerCloseDeadlineCanBeRetried(t *testing.T) {
+	writer := &blockingWriter{started: make(chan struct{}), release: make(chan struct{})}
+	logger := newLogger(writer, Options{ProductVersion: "test"}, 1)
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(writer.release) }) }
+	t.Cleanup(func() {
+		release()
+		closeLogger(t, logger)
+	})
+
+	handler := logger.WithAuditLog(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/infer", nil)
+	req.RemoteAddr = "192.0.2.7:8080"
+	handler(httptest.NewRecorder(), req)
+
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("audit writer did not receive the event")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	closeResult := make(chan error, 1)
+	go func() {
+		closeResult <- logger.Close(ctx)
+	}()
+	select {
+	case err := <-closeResult:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Close error = %v, want context deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return while the audit writer remained blocked")
+	}
+
+	release()
+	closeLogger(t, logger)
 }
 
 func TestSlowWriterDoesNotBlockRequestHandlers(t *testing.T) {
@@ -590,7 +703,7 @@ func TestSlowWriterDoesNotBlockRequestHandlers(t *testing.T) {
 	}
 
 	close(writer.release)
-	logger.Close()
+	closeLogger(t, logger)
 }
 
 func TestLoggedTimeIsAssignedAtWriterBoundary(t *testing.T) {
@@ -601,7 +714,7 @@ func TestLoggedTimeIsAssignedAtWriterBoundary(t *testing.T) {
 		if !released {
 			close(writer.release)
 		}
-		logger.Close()
+		closeLogger(t, logger)
 	})
 	handler := logger.WithAuditLog(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
@@ -623,7 +736,7 @@ func TestLoggedTimeIsAssignedAtWriterBoundary(t *testing.T) {
 	writerBoundary := time.Now().UnixMilli()
 	close(writer.release)
 	released = true
-	logger.Close()
+	closeLogger(t, logger)
 
 	decoder := json.NewDecoder(bytes.NewReader(writer.Bytes()))
 	var first, second Event
@@ -641,26 +754,77 @@ func TestLoggedTimeIsAssignedAtWriterBoundary(t *testing.T) {
 	}
 }
 
-func TestResolveResourceMetadata(t *testing.T) {
-	attrs := &authz.ResourceAttributes{Name: "config-name", Namespace: "config-namespace"}
+func TestStaticResourceMetadata(t *testing.T) {
 	tests := []struct {
-		name     string
-		explicit ResourceMetadata
-		attrs    *authz.ResourceAttributes
-		want     ResourceMetadata
+		name  string
+		attrs *authz.ResourceAttributes
+		want  ResourceMetadata
 	}{
-		{name: "explicit values take precedence", explicit: ResourceMetadata{Name: "flag-name", Namespace: "flag-namespace"}, attrs: attrs, want: ResourceMetadata{Name: "flag-name", Namespace: "flag-namespace"}},
-		{name: "each missing value falls back independently", explicit: ResourceMetadata{Name: "flag-name"}, attrs: attrs, want: ResourceMetadata{Name: "flag-name", Namespace: "config-namespace"}},
-		{name: "authorization attributes are fallback", attrs: attrs, want: ResourceMetadata{Name: "config-name", Namespace: "config-namespace"}},
-		{name: "authorization templates are unavailable until request resolution", attrs: &authz.ResourceAttributes{Name: "{{.Name}}", Namespace: "{{.Namespace}}"}, want: ResourceMetadata{}},
-		{name: "missing metadata is allowed", want: ResourceMetadata{}},
+		{name: "nil attributes", want: ResourceMetadata{}},
+		{name: "static values", attrs: &authz.ResourceAttributes{Name: "config-name", Namespace: "config-namespace"}, want: ResourceMetadata{Name: "config-name", Namespace: "config-namespace"}},
+		{name: "valid templates", attrs: &authz.ResourceAttributes{Name: "{{.Name}}", Namespace: "{{.Namespace}}"}, want: ResourceMetadata{}},
+		{name: "opening delimiter", attrs: &authz.ResourceAttributes{Name: "{{.Name", Namespace: "config-namespace"}, want: ResourceMetadata{Namespace: "config-namespace"}},
+		{name: "closing delimiter", attrs: &authz.ResourceAttributes{Name: "config-name", Namespace: ".Namespace}}"}, want: ResourceMetadata{Name: "config-name"}},
+		{name: "mixed static and template values", attrs: &authz.ResourceAttributes{Name: "config-name", Namespace: "{{.Namespace}}"}, want: ResourceMetadata{Name: "config-name"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := ResolveResourceMetadata(tt.explicit.Name, tt.explicit.Namespace, tt.attrs)
+			got := StaticResourceMetadata(tt.attrs)
 			if diff := cmp.Diff(tt.want, got); diff != "" {
 				t.Errorf("metadata mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+func TestResourceMetadataPrecedenceAndOptionalFields(t *testing.T) {
+	logger := NewLogger(io.Discard, Options{
+		Resource:              ResourceMetadata{Name: "explicit-name", Type: "CustomType"},
+		AuthorizationResource: ResourceMetadata{Name: "static-name", Namespace: "static-namespace"},
+		AIProvider:            "Provider",
+		ProductVersion:        "test",
+	})
+	t.Cleanup(func() { closeLogger(t, logger) })
+	request := httptest.NewRequest(http.MethodPost, "http://proxy/infer", nil)
+	event := logger.event(request, &requestContext{resource: ResourceMetadata{Name: "request-name", Namespace: "request-namespace"}}, httpsnoop.Metrics{Code: http.StatusOK}, time.Unix(1, 0))
+	want := []Resource{{Name: "explicit-name", Namespace: "request-namespace", Type: "CustomType", RoleID: resourceRoleTargetID, Role: resourceRoleTargetName}}
+	if diff := cmp.Diff(want, event.Resources); diff != "" {
+		t.Errorf("resource metadata mismatch (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff(&AIModel{Name: "explicit-name", AIProvider: "Provider"}, event.AIModel); diff != "" {
+		t.Errorf("AI model mismatch (-want +got):\n%s", diff)
+	}
+
+	logger = NewLogger(io.Discard, Options{
+		Resource:              ResourceMetadata{Namespace: "explicit-namespace"},
+		AuthorizationResource: ResourceMetadata{Name: "static-name", Namespace: "static-namespace"},
+		ProductVersion:        "test",
+	})
+	t.Cleanup(func() { closeLogger(t, logger) })
+	event = logger.event(request, &requestContext{}, httpsnoop.Metrics{Code: http.StatusOK}, time.Unix(1, 0))
+	want = []Resource{{Name: "static-name", Namespace: "explicit-namespace", RoleID: resourceRoleTargetID, Role: resourceRoleTargetName}}
+	if diff := cmp.Diff(want, event.Resources); diff != "" {
+		t.Errorf("static resource fallback mismatch (-want +got):\n%s", diff)
+	}
+	if event.AIModel != nil {
+		t.Errorf("empty provider must omit AI model: %+v", event.AIModel)
+	}
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), `"type":`) {
+		t.Errorf("empty resource type must be omitted: %s", encoded)
+	}
+
+	logger = NewLogger(io.Discard, Options{
+		Resource:       ResourceMetadata{Namespace: "explicit-namespace"},
+		AIProvider:     "Provider",
+		ProductVersion: "test",
+	})
+	t.Cleanup(func() { closeLogger(t, logger) })
+	event = logger.event(request, &requestContext{}, httpsnoop.Metrics{Code: http.StatusOK}, time.Unix(1, 0))
+	if len(event.Resources) != 0 || event.AIModel != nil {
+		t.Errorf("unresolved resource name must omit resources and AI model: %+v", event)
 	}
 }

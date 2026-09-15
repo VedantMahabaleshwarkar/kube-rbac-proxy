@@ -24,8 +24,10 @@ func TestAuditFlags(t *testing.T) {
 	flagSet := flagSets.FlagSet("audit logging")
 	for _, name := range []string{
 		"audit-log-enabled",
-		"audit-isvc-name",
-		"audit-isvc-namespace",
+		"audit-resource-name",
+		"audit-resource-namespace",
+		"audit-resource-type",
+		"audit-ai-provider",
 		"audit-use-forwarded-for",
 	} {
 		if flagSet.Lookup(name) == nil {
@@ -33,19 +35,27 @@ func TestAuditFlags(t *testing.T) {
 		}
 	}
 
-	if o.AuditLogEnabled || o.AuditUseForwardedFor || o.AuditISVCName != "" || o.AuditISVCNamespace != "" {
+	for _, name := range []string{"audit-isvc-name", "audit-isvc-namespace"} {
+		if flagSet.Lookup(name) != nil {
+			t.Fatalf("legacy flag --%s must not be registered", name)
+		}
+	}
+
+	if o.AuditLogEnabled || o.AuditUseForwardedFor || o.AuditResourceName != "" || o.AuditResourceNamespace != "" || o.AuditResourceType != "" || o.AuditAIProvider != "" {
 		t.Fatalf("unexpected audit defaults: %+v", o)
 	}
 
 	if err := flagSet.Parse([]string{
 		"--audit-log-enabled",
-		"--audit-isvc-name=model",
-		"--audit-isvc-namespace=models",
+		"--audit-resource-name=model",
+		"--audit-resource-namespace=models",
+		"--audit-resource-type=InferenceService",
+		"--audit-ai-provider=KServe",
 		"--audit-use-forwarded-for",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !o.AuditLogEnabled || !o.AuditUseForwardedFor || o.AuditISVCName != "model" || o.AuditISVCNamespace != "models" {
+	if !o.AuditLogEnabled || !o.AuditUseForwardedFor || o.AuditResourceName != "model" || o.AuditResourceNamespace != "models" || o.AuditResourceType != "InferenceService" || o.AuditAIProvider != "KServe" {
 		t.Fatalf("audit flags were not parsed: %+v", o)
 	}
 }

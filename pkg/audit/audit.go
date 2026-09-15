@@ -41,33 +41,35 @@ import (
 type ResourceMetadata struct {
 	Name      string
 	Namespace string
+	Type      string
 }
 
 type Options struct {
 	Resource              ResourceMetadata
 	AuthorizationResource ResourceMetadata
+	AIProvider            string
 	UseForwardedFor       bool
 	UpstreamURL           *url.URL
 	ProductVersion        string
 }
 
-// ResolveResourceMetadata gives explicit audit flags precedence over the
-// resource attributes already used for authorization.
-func ResolveResourceMetadata(name, namespace string, attrs *authz.ResourceAttributes) ResourceMetadata {
-	metadata := ResourceMetadata{Name: name, Namespace: namespace}
+// StaticResourceMetadata returns authorization resource attributes that do not
+// require request-time template resolution.
+func StaticResourceMetadata(attrs *authz.ResourceAttributes) ResourceMetadata {
+	metadata := ResourceMetadata{}
 	if attrs == nil {
 		return metadata
 	}
-	if metadata.Name == "" && !isTemplate(attrs.Name) {
+	if !containsTemplateDelimiter(attrs.Name) {
 		metadata.Name = attrs.Name
 	}
-	if metadata.Namespace == "" && !isTemplate(attrs.Namespace) {
+	if !containsTemplateDelimiter(attrs.Namespace) {
 		metadata.Namespace = attrs.Namespace
 	}
 	return metadata
 }
 
-func isTemplate(value string) bool {
+func containsTemplateDelimiter(value string) bool {
 	return strings.Contains(value, "{{") || strings.Contains(value, "}}")
 }
 
@@ -90,10 +92,10 @@ type Logger struct {
 	encoder    *json.Encoder
 	options    Options
 	events     chan []byte
+	done       chan struct{}
 	stateMu    sync.RWMutex
 	closed     bool
 	closeOnce  sync.Once
-	worker     sync.WaitGroup
 	dropped    atomic.Uint64
 	lastReport atomic.Int64
 }
@@ -112,14 +114,14 @@ func newLogger(w io.Writer, options Options, queueSize int) *Logger {
 		encoder: encoder,
 		options: options,
 		events:  make(chan []byte, queueSize),
+		done:    make(chan struct{}),
 	}
-	logger.worker.Add(1)
 	go logger.run()
 	return logger
 }
 
 func (l *Logger) run() {
-	defer l.worker.Done()
+	defer close(l.done)
 	for payload := range l.events {
 		var event Event
 		if err := json.Unmarshal(payload, &event); err != nil {
@@ -133,16 +135,24 @@ func (l *Logger) run() {
 	}
 }
 
-// Close flushes queued events and stops the writer goroutine. Callers must not
-// submit new requests through this Logger after Close returns.
-func (l *Logger) Close() {
+// Close stops accepting events, drains queued events, and waits for the writer
+// goroutine. Writes to an arbitrary io.Writer cannot be forcibly interrupted.
+// When ctx expires, Close returns promptly, but callers that then exit the
+// process may lose events still queued behind a blocked writer.
+func (l *Logger) Close(ctx context.Context) error {
 	l.closeOnce.Do(func() {
 		l.stateMu.Lock()
 		l.closed = true
 		close(l.events)
 		l.stateMu.Unlock()
-		l.worker.Wait()
 	})
+
+	select {
+	case <-l.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // CaptureUser records the authenticated Kubernetes principal for the outer
@@ -191,7 +201,7 @@ func (l *Logger) WithAuditLog(next http.HandlerFunc) http.HandlerFunc {
 			}
 			event := l.event(req, data, metrics, started)
 			if panicked {
-				event.Status = "Failure"
+				event.Status = statusFailureName
 				event.StatusID = statusFailureID
 			}
 			l.enqueue(event)
@@ -284,9 +294,9 @@ func (l *Logger) report(message string, err error) {
 
 func (l *Logger) event(req *http.Request, data *requestContext, metrics httpsnoop.Metrics, started time.Time) Event {
 	srcEndpoint, forwardedFor := sourceEndpoint(req, l.options.UseForwardedFor)
-	status, statusID := "Success", statusSuccessID
+	status, statusID := statusSuccessName, statusSuccessID
 	if metrics.Code >= http.StatusBadRequest {
-		status, statusID = "Failure", statusFailureID
+		status, statusID = statusFailureName, statusFailureID
 	}
 
 	event := Event{
@@ -302,9 +312,9 @@ func (l *Logger) event(req *http.Request, data *requestContext, metrics httpsnoo
 		Time:         started.UnixMilli(),
 		Metadata: Metadata{
 			Version:  ocsfVersion,
-			Profiles: []string{"ai_operation"},
+			Profiles: []string{aiOperationProfile},
 			Product: Product{
-				Name:    "kube-rbac-proxy",
+				Name:    productName,
 				Version: l.options.ProductVersion,
 			},
 		},
@@ -347,13 +357,12 @@ func (l *Logger) event(req *http.Request, data *requestContext, metrics httpsnoo
 		event.Resources = []Resource{{
 			Name:      resource.Name,
 			Namespace: resource.Namespace,
-			Type:      "InferenceService",
+			Type:      resource.Type,
 			RoleID:    resourceRoleTargetID,
 			Role:      resourceRoleTargetName,
 		}}
-		event.AIModel = &AIModel{
-			Name:       resource.Name,
-			AIProvider: "KServe",
+		if l.options.AIProvider != "" {
+			event.AIModel = &AIModel{Name: resource.Name, AIProvider: l.options.AIProvider}
 		}
 	}
 

@@ -23,22 +23,194 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/brancz/kube-rbac-proxy/cmd/kube-rbac-proxy/app/options"
 	"github.com/brancz/kube-rbac-proxy/pkg/audit"
 	"github.com/brancz/kube-rbac-proxy/pkg/authn"
 	"github.com/brancz/kube-rbac-proxy/pkg/authz"
 	"github.com/brancz/kube-rbac-proxy/pkg/proxy"
 	"github.com/google/go-cmp/cmp"
+	"github.com/spf13/pflag"
 
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	"k8s.io/component-base/version"
 )
+
+func closeAuditLogger(t *testing.T, logger *audit.Logger) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := logger.Close(ctx); err != nil {
+		t.Fatalf("close audit logger: %v", err)
+	}
+}
+
+func decodeAuditEvents(t *testing.T, output *bytes.Buffer) []audit.Event {
+	t.Helper()
+
+	decoder := json.NewDecoder(output)
+	var events []audit.Event
+	for {
+		var event audit.Event
+		err := decoder.Decode(&event)
+		if err == io.EOF {
+			return events
+		}
+		if err != nil {
+			t.Fatalf("decode audit event: %v", err)
+		}
+		events = append(events, event)
+	}
+}
+
+func TestCompleteBuildsAuditOptions(t *testing.T) {
+	wantUpstream, err := url.Parse("https://upstream.example.test:8443/v1")
+	if err != nil {
+		t.Fatalf("parse expected upstream: %v", err)
+	}
+	tests := []struct {
+		name                      string
+		authorizationResource     authz.ResourceAttributes
+		wantAuthorizationResource audit.ResourceMetadata
+	}{
+		{
+			name: "static name and namespace are retained",
+			authorizationResource: authz.ResourceAttributes{
+				Name:      "static-model",
+				Namespace: "static-namespace",
+			},
+			wantAuthorizationResource: audit.ResourceMetadata{
+				Name:      "static-model",
+				Namespace: "static-namespace",
+			},
+		},
+		{
+			name: "template namespace is omitted independently",
+			authorizationResource: authz.ResourceAttributes{
+				Name:      "static-model",
+				Namespace: "{{ .Value }}",
+			},
+			wantAuthorizationResource: audit.ResourceMetadata{Name: "static-model"},
+		},
+		{
+			name: "template name and namespace are omitted",
+			authorizationResource: authz.ResourceAttributes{
+				Name:      "{{ .Value }}",
+				Namespace: "namespace-{{ .Value }}",
+			},
+		},
+		{
+			name: "one-sided template delimiters are omitted",
+			authorizationResource: authz.ResourceAttributes{
+				Name:      "model-{{",
+				Namespace: "namespace-}}",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kubeconfigPath := filepath.Join(t.TempDir(), "kubeconfig")
+			kubeconfig := clientcmdapi.Config{
+				Clusters: map[string]*clientcmdapi.Cluster{
+					"test": {
+						Server:                "https://127.0.0.1",
+						InsecureSkipTLSVerify: true,
+					},
+				},
+				AuthInfos: map[string]*clientcmdapi.AuthInfo{
+					"test": {Token: "test-token"},
+				},
+				Contexts: map[string]*clientcmdapi.Context{
+					"test": {Cluster: "test", AuthInfo: "test"},
+				},
+				CurrentContext: "test",
+			}
+			if err := clientcmd.WriteToFile(kubeconfig, kubeconfigPath); err != nil {
+				t.Fatalf("write kubeconfig: %v", err)
+			}
+
+			o := options.NewProxyRunOptions()
+			o.KubeconfigLocation = kubeconfigPath
+			o.Upstream = "https://upstream.example.test:8443/v1"
+			o.AuditLogEnabled = true
+			o.AuditResourceName = "explicit-model"
+			o.AuditResourceNamespace = "explicit-namespace"
+			o.AuditResourceType = "InferenceService"
+			o.AuditAIProvider = "KServe"
+			o.AuditUseForwardedFor = true
+			tt.authorizationResource.Resource = "inferenceservices"
+			o.Auth.Authorization.ResourceAttributes = &tt.authorizationResource
+
+			completed, err := Complete(o)
+			if err != nil {
+				t.Fatalf("Complete() error: %v", err)
+			}
+			if !completed.auditLogEnabled {
+				t.Fatal("auditLogEnabled = false, want true")
+			}
+			if completed.kubeClient == nil {
+				t.Fatal("kubeClient = nil, want client constructed without a live request")
+			}
+
+			want := audit.Options{
+				Resource: audit.ResourceMetadata{
+					Name:      "explicit-model",
+					Namespace: "explicit-namespace",
+					Type:      "InferenceService",
+				},
+				AuthorizationResource: tt.wantAuthorizationResource,
+				AIProvider:            "KServe",
+				UseForwardedFor:       true,
+				UpstreamURL:           wantUpstream,
+				ProductVersion:        version.Get().GitVersion,
+			}
+			if diff := cmp.Diff(want, completed.auditOptions); diff != "" {
+				t.Errorf("audit options mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestCommandExposesAuditFlags(t *testing.T) {
+	cmd := NewKubeRBACProxyCommand()
+	var got []string
+	cmd.Flags().VisitAll(func(flag *pflag.Flag) {
+		if strings.HasPrefix(flag.Name, "audit-") {
+			got = append(got, flag.Name)
+		}
+	})
+	sort.Strings(got)
+	want := []string{
+		"audit-ai-provider",
+		"audit-log-enabled",
+		"audit-resource-name",
+		"audit-resource-namespace",
+		"audit-resource-type",
+		"audit-use-forwarded-for",
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("audit flags mismatch (-want +got):\n%s", diff)
+	}
+	for _, oldName := range []string{"audit-isvc-name", "audit-isvc-namespace"} {
+		if cmd.Flags().Lookup(oldName) != nil {
+			t.Errorf("obsolete flag %q is still registered", oldName)
+		}
+	}
+}
 
 func Test_parseAuthorizationConfigFile(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -235,26 +407,61 @@ func Test_parseAuthorizationConfigFile(t *testing.T) {
 
 func TestBuildRequestHandlerAuditBoundaries(t *testing.T) {
 	tests := []struct {
-		name         string
-		path         string
-		allowPaths   []string
-		ignorePaths  []string
-		wantStatus   int
-		wantEvents   int
-		wantDirect   bool
-		auditEnabled bool
+		name          string
+		path          string
+		allowPaths    []string
+		ignorePaths   []string
+		auditEnabled  bool
+		wantStatus    int
+		wantEvents    int
+		wantDirect    bool
+		wantProtected bool
 	}{
-		{name: "protected request is audited", path: "/infer", wantStatus: http.StatusAccepted, wantEvents: 1, auditEnabled: true},
-		{name: "auditing disabled produces no output", path: "/infer", wantStatus: http.StatusAccepted},
-		{name: "ignored request bypasses audit", path: "/metrics", ignorePaths: []string{"/metrics"}, wantStatus: http.StatusNoContent, wantDirect: true, auditEnabled: true},
-		{name: "allow path rejection happens before audit", path: "/blocked", allowPaths: []string{"/infer"}, wantStatus: http.StatusNotFound, auditEnabled: true},
+		{
+			name:          "protected request is audited",
+			path:          "/infer",
+			auditEnabled:  true,
+			wantStatus:    http.StatusAccepted,
+			wantEvents:    1,
+			wantProtected: true,
+		},
+		{
+			name:          "auditing disabled produces no output",
+			path:          "/infer",
+			wantStatus:    http.StatusAccepted,
+			wantProtected: true,
+		},
+		{
+			name:         "ignored request bypasses audit",
+			path:         "/metrics",
+			ignorePaths:  []string{"/metrics"},
+			auditEnabled: true,
+			wantStatus:   http.StatusNoContent,
+			wantDirect:   true,
+		},
+		{
+			name:         "allow path rejection happens before audit",
+			path:         "/blocked",
+			allowPaths:   []string{"/infer"},
+			auditEnabled: true,
+			wantStatus:   http.StatusNotFound,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var output bytes.Buffer
-			auditLogger := audit.NewLogger(&output, audit.Options{ProductVersion: "test"})
+			auditLogger := audit.NewLogger(&output, audit.Options{
+				Resource: audit.ResourceMetadata{
+					Name:      "route-model",
+					Namespace: "route-namespace",
+					Type:      "InferenceService",
+				},
+				ProductVersion: "test",
+			})
+			protectedCalled := false
 			protected := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				protectedCalled = true
 				w.WriteHeader(http.StatusAccepted)
 			})
 			if tt.auditEnabled {
@@ -265,13 +472,13 @@ func TestBuildRequestHandlerAuditBoundaries(t *testing.T) {
 				directCalled = true
 				w.WriteHeader(http.StatusNoContent)
 			}
-			handler := buildRequestHandler(direct, protected, tt.allowPaths, tt.ignorePaths, 0)
+			handler := buildRequestHandler(direct, protected, tt.allowPaths, tt.ignorePaths)
 
 			recorder := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodPost, tt.path, nil)
 			req.RemoteAddr = "192.0.2.1:1234"
 			handler(recorder, req)
-			auditLogger.Close()
+			closeAuditLogger(t, auditLogger)
 
 			if recorder.Code != tt.wantStatus {
 				t.Errorf("status = %d, want %d", recorder.Code, tt.wantStatus)
@@ -279,58 +486,120 @@ func TestBuildRequestHandlerAuditBoundaries(t *testing.T) {
 			if directCalled != tt.wantDirect {
 				t.Errorf("direct handler called = %t, want %t", directCalled, tt.wantDirect)
 			}
-
-			decoder := json.NewDecoder(&output)
-			events := 0
-			for {
-				var event audit.Event
-				err := decoder.Decode(&event)
-				if err == io.EOF {
-					break
-				}
-				if err != nil {
-					t.Fatalf("decode event: %v", err)
-				}
-				events++
+			if protectedCalled != tt.wantProtected {
+				t.Errorf("protected handler called = %t, want %t", protectedCalled, tt.wantProtected)
 			}
-			if events != tt.wantEvents {
-				t.Errorf("audit events = %d, want %d", events, tt.wantEvents)
+
+			events := decodeAuditEvents(t, &output)
+			if len(events) != tt.wantEvents {
+				t.Fatalf("audit events = %d, want %d", len(events), tt.wantEvents)
+			}
+			if tt.wantEvents == 1 {
+				event := events[0]
+				if event.HTTPResponse.Code != http.StatusAccepted || event.StatusCode != "202" {
+					t.Errorf("audit response = (%d, %q), want (202, %q)", event.HTTPResponse.Code, event.StatusCode, "202")
+				}
+				if event.Status != "Success" || event.StatusID != 1 {
+					t.Errorf("audit status = (%q, %d), want (Success, 1)", event.Status, event.StatusID)
+				}
+				wantUser := audit.User{Name: "Unknown", TypeID: 0}
+				if diff := cmp.Diff(wantUser, event.Actor.User); diff != "" {
+					t.Errorf("audit user mismatch (-want +got):\n%s", diff)
+				}
+				if event.API.Operation != "POST /infer" || event.HTTPRequest.URL.Path != "/infer" {
+					t.Errorf("audit operation/path = (%q, %q), want (%q, %q)", event.API.Operation, event.HTTPRequest.URL.Path, "POST /infer", "/infer")
+				}
+				wantResources := []audit.Resource{{
+					Name:      "route-model",
+					Namespace: "route-namespace",
+					Type:      "InferenceService",
+					RoleID:    1,
+					Role:      "Target",
+				}}
+				if diff := cmp.Diff(wantResources, event.Resources); diff != "" {
+					t.Errorf("audit resources mismatch (-want +got):\n%s", diff)
+				}
 			}
 		})
 	}
 }
 
-func TestBuildProtectedHandlerAuditsAccessFailures(t *testing.T) {
+func TestBuildProtectedHandlerAuditsFullChain(t *testing.T) {
 	tests := []struct {
-		name          string
-		authenticated bool
-		decision      authorizer.Decision
-		wantStatus    int
-		wantUser      string
+		name           string
+		auditEnabled   bool
+		authenticated  bool
+		decision       authorizer.Decision
+		wantStatus     int
+		wantEvents     int
+		wantUpstream   bool
+		wantAuditUser  audit.User
+		wantStatusName string
+		wantStatusID   int
+		wantResource   bool
 	}{
 		{
-			name:       "authentication failure",
-			wantStatus: http.StatusUnauthorized,
-			wantUser:   "Unknown",
+			name:           "authorized request reaches upstream",
+			auditEnabled:   true,
+			authenticated:  true,
+			decision:       authorizer.DecisionAllow,
+			wantStatus:     http.StatusOK,
+			wantEvents:     1,
+			wantUpstream:   true,
+			wantAuditUser:  audit.User{Name: "alice", UID: "alice-uid", TypeID: 1, Groups: []audit.Group{{Name: "developers"}}},
+			wantStatusName: "Success",
+			wantStatusID:   1,
+			wantResource:   true,
 		},
 		{
-			name:          "authorization failure",
+			name:           "authentication failure",
+			auditEnabled:   true,
+			wantStatus:     http.StatusUnauthorized,
+			wantEvents:     1,
+			wantAuditUser:  audit.User{Name: "Unknown", TypeID: 0},
+			wantStatusName: "Failure",
+			wantStatusID:   2,
+		},
+		{
+			name:           "authorization denial retains observed resource",
+			auditEnabled:   true,
+			authenticated:  true,
+			decision:       authorizer.DecisionDeny,
+			wantStatus:     http.StatusForbidden,
+			wantEvents:     1,
+			wantAuditUser:  audit.User{Name: "alice", UID: "alice-uid", TypeID: 1, Groups: []audit.Group{{Name: "developers"}}},
+			wantStatusName: "Failure",
+			wantStatusID:   2,
+			wantResource:   true,
+		},
+		{
+			name:          "auditing disabled",
 			authenticated: true,
-			decision:      authorizer.DecisionDeny,
-			wantStatus:    http.StatusForbidden,
-			wantUser:      "alice",
+			decision:      authorizer.DecisionAllow,
+			wantStatus:    http.StatusOK,
+			wantUpstream:  true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var output bytes.Buffer
-			auditLogger := audit.NewLogger(&output, audit.Options{ProductVersion: "test"})
+			var auditLogger *audit.Logger
+			if tt.auditEnabled {
+				// Deliberately omit explicit and static fallback metadata. In the
+				// denial case, any emitted resource must have been observed before
+				// the authorizer rejected the request.
+				auditLogger = audit.NewLogger(&output, audit.Options{ProductVersion: "test"})
+			}
 			requestAuthenticator := authenticator.RequestFunc(func(*http.Request) (*authenticator.Response, bool, error) {
 				if !tt.authenticated {
 					return nil, false, nil
 				}
-				return &authenticator.Response{User: &user.DefaultInfo{Name: "alice"}}, true, nil
+				return &authenticator.Response{User: &user.DefaultInfo{
+					Name:   "alice",
+					UID:    "alice-uid",
+					Groups: []string{"developers"},
+				}}, true, nil
 			})
 			requestAuthorizer := authorizer.AuthorizerFunc(func(context.Context, authorizer.Attributes) (authorizer.Decision, string, error) {
 				return tt.decision, "test decision", nil
@@ -341,41 +610,67 @@ func TestBuildProtectedHandlerAuditsAccessFailures(t *testing.T) {
 					Token:  &authn.TokenConfig{},
 				},
 				Authorization: &authz.Config{ResourceAttributes: &authz.ResourceAttributes{
-					Resource: "inferenceservices",
-					Verb:     "get",
+					Resource:  "inferenceservices",
+					Verb:      "create",
+					Name:      "observed-model",
+					Namespace: "observed-namespace",
 				}},
 			}
+			upstreamCalled := false
 			upstream := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(http.StatusAccepted)
+				upstreamCalled = true
+				w.WriteHeader(http.StatusOK)
 			})
 			protected := buildProtectedHandler(upstream, authConfig, requestAuthenticator, requestAuthorizer, auditLogger)
-			handler := buildRequestHandler(upstream, protected, nil, nil, 0)
+			handler := buildRequestHandler(upstream, protected, nil, nil)
 
 			recorder := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodPost, "/infer", nil)
 			req.RemoteAddr = "192.0.2.1:1234"
 			handler(recorder, req)
-			auditLogger.Close()
+			if auditLogger != nil {
+				closeAuditLogger(t, auditLogger)
+			}
 
 			if recorder.Code != tt.wantStatus {
-				t.Fatalf("status = %d, want %d", recorder.Code, tt.wantStatus)
+				t.Errorf("status = %d, want %d", recorder.Code, tt.wantStatus)
 			}
-			decoder := json.NewDecoder(&output)
-			var event audit.Event
-			if err := decoder.Decode(&event); err != nil {
-				t.Fatalf("decode audit event: %v", err)
+			if upstreamCalled != tt.wantUpstream {
+				t.Errorf("upstream called = %t, want %t", upstreamCalled, tt.wantUpstream)
 			}
-			if event.HTTPResponse.Code != tt.wantStatus {
-				t.Errorf("audit response code = %d, want %d", event.HTTPResponse.Code, tt.wantStatus)
+
+			events := decodeAuditEvents(t, &output)
+			if len(events) != tt.wantEvents {
+				t.Fatalf("audit events = %d, want %d", len(events), tt.wantEvents)
 			}
-			if event.Status != "Failure" {
-				t.Errorf("audit status = %q, want Failure", event.Status)
+			if tt.wantEvents == 0 {
+				return
 			}
-			if event.Actor.User.Name != tt.wantUser {
-				t.Errorf("audit user = %q, want %q", event.Actor.User.Name, tt.wantUser)
+
+			event := events[0]
+			if event.HTTPResponse.Code != tt.wantStatus || event.StatusCode != strconv.Itoa(tt.wantStatus) {
+				t.Errorf("audit response = (%d, %q), want (%d, %q)", event.HTTPResponse.Code, event.StatusCode, tt.wantStatus, strconv.Itoa(tt.wantStatus))
 			}
-			if err := decoder.Decode(&audit.Event{}); err != io.EOF {
-				t.Fatalf("expected exactly one audit event, got trailing decode error %v", err)
+			if event.Status != tt.wantStatusName || event.StatusID != tt.wantStatusID {
+				t.Errorf("audit status = (%q, %d), want (%q, %d)", event.Status, event.StatusID, tt.wantStatusName, tt.wantStatusID)
+			}
+			if diff := cmp.Diff(tt.wantAuditUser, event.Actor.User); diff != "" {
+				t.Errorf("audit user mismatch (-want +got):\n%s", diff)
+			}
+			if event.API.Operation != "POST /infer" || event.HTTPRequest.URL.Path != "/infer" {
+				t.Errorf("audit operation/path = (%q, %q), want (%q, %q)", event.API.Operation, event.HTTPRequest.URL.Path, "POST /infer", "/infer")
+			}
+			wantResources := []audit.Resource(nil)
+			if tt.wantResource {
+				wantResources = []audit.Resource{{
+					Name:      "observed-model",
+					Namespace: "observed-namespace",
+					RoleID:    1,
+					Role:      "Target",
+				}}
+			}
+			if diff := cmp.Diff(wantResources, event.Resources); diff != "" {
+				t.Errorf("audit resources mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}

@@ -30,8 +30,13 @@ const (
 	severityID   = 1
 	severityName = "Informational"
 
-	statusSuccessID = 1
-	statusFailureID = 2
+	statusSuccessID   = 1
+	statusFailureID   = 2
+	statusSuccessName = "Success"
+	statusFailureName = "Failure"
+
+	aiOperationProfile = "ai_operation"
+	productName        = "kube-rbac-proxy"
 
 	resourceRoleTargetID   = 1
 	resourceRoleTargetName = "Target"
@@ -122,7 +127,7 @@ type Endpoint struct {
 type Resource struct {
 	Name      string `json:"name"`
 	Namespace string `json:"namespace,omitempty"`
-	Type      string `json:"type"`
+	Type      string `json:"type,omitempty"`
 	RoleID    int    `json:"role_id"`
 	Role      string `json:"role"`
 }

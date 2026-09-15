@@ -56,10 +56,12 @@ type ProxyRunOptions struct {
 	QPS   float32
 	Burst int
 
-	AuditLogEnabled      bool
-	AuditISVCName        string
-	AuditISVCNamespace   string
-	AuditUseForwardedFor bool
+	AuditLogEnabled        bool
+	AuditResourceName      string
+	AuditResourceNamespace string
+	AuditResourceType      string
+	AuditAIProvider        string
+	AuditUseForwardedFor   bool
 
 	flagSet *pflag.FlagSet
 }
@@ -99,7 +101,7 @@ func (o *ProxyRunOptions) Flags() k8sapiflag.NamedFlagSets {
 	flagset.StringVar(&o.InsecureListenAddress, "insecure-listen-address", "", "[DEPRECATED] The address the kube-rbac-proxy HTTP server should listen on.")
 	flagset.StringVar(&o.SecureListenAddress, "secure-listen-address", "", "The address the kube-rbac-proxy HTTPs server should listen on.")
 	flagset.StringVar(&o.Upstream, "upstream", "", "The upstream URL to proxy to once requests have successfully been authenticated and authorized.")
-	flagset.DurationVar(&o.UpstreamTimeout, "upstream-timeout", 30*time.Second, "Maximum amount of time the server will wait for a response from the upstream.")
+	flagset.DurationVar(&o.UpstreamTimeout, "upstream-timeout", 30*time.Second, "Maximum amount of time the server will wait for upstream response headers.")
 	flagset.BoolVar(&o.UpstreamForceH2C, "upstream-force-h2c", false, "Force h2c to communicate with the upstream. This is required when the upstream speaks h2c(http/2 cleartext - insecure variant of http/2) only. For example, go-grpc server in the insecure mode, such as helm's tiller w/o TLS, speaks h2c only")
 	flagset.StringVar(&o.UpstreamCAFile, "upstream-ca-file", "", "The CA the upstream uses for TLS connection. This is required when the upstream uses TLS and its own CA certificate")
 	flagset.StringVar(&o.ConfigFileName, "config-file", "", "Configuration file to configure kube-rbac-proxy.")
@@ -146,8 +148,10 @@ func (o *ProxyRunOptions) Flags() k8sapiflag.NamedFlagSets {
 	// Audit flags
 	auditFlagSet := namedFlagSets.FlagSet("audit logging")
 	auditFlagSet.BoolVar(&o.AuditLogEnabled, "audit-log-enabled", false, "Emit OCSF AI inference audit events as JSON lines to stdout for authentication-protected requests.")
-	auditFlagSet.StringVar(&o.AuditISVCName, "audit-isvc-name", "", "InferenceService name to include in audit events. Falls back to authorization resourceAttributes.name.")
-	auditFlagSet.StringVar(&o.AuditISVCNamespace, "audit-isvc-namespace", "", "InferenceService namespace to include in audit events. Falls back to authorization resourceAttributes.namespace.")
+	auditFlagSet.StringVar(&o.AuditResourceName, "audit-resource-name", "", "Resource name to include in audit events. Falls back to authorization resourceAttributes.name.")
+	auditFlagSet.StringVar(&o.AuditResourceNamespace, "audit-resource-namespace", "", "Resource namespace to include in audit events. Falls back to authorization resourceAttributes.namespace.")
+	auditFlagSet.StringVar(&o.AuditResourceType, "audit-resource-type", "", "OCSF resource type to include in audit events.")
+	auditFlagSet.StringVar(&o.AuditAIProvider, "audit-ai-provider", "", "AI provider to include in audit events when a resource name is resolved.")
 	auditFlagSet.BoolVar(&o.AuditUseForwardedFor, "audit-use-forwarded-for", false, "Trust X-Forwarded-For for audit source addresses. Enable only when the listener is reached through a trusted router.")
 
 	// disabled flags

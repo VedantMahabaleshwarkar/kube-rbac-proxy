@@ -89,14 +89,16 @@ Kube-rbac-proxy flags:
       --upstream-client-cert-file string            If set, the client will be used to authenticate the proxy to upstream. Requires --upstream-client-key-file to be set, too.
       --upstream-client-key-file string             The key matching the certificate from --upstream-client-cert-file. If set, requires --upstream-client-cert-file to be set, too.
       --upstream-force-h2c                          Force h2c to communicate with the upstream. This is required when the upstream speaks h2c(http/2 cleartext - insecure variant of http/2) only. For example, go-grpc server in the insecure mode, such as helm's tiller w/o TLS, speaks h2c only
-      --upstream-timeout duration                   Maximum amount of time the server will wait for a response from the upstream. (default 30s)
+      --upstream-timeout duration                   Maximum amount of time the server will wait for upstream response headers. (default 30s)
 
 Audit logging flags:
 
-      --audit-isvc-name string        InferenceService name to include in audit events. Falls back to authorization resourceAttributes.name.
-      --audit-isvc-namespace string   InferenceService namespace to include in audit events. Falls back to authorization resourceAttributes.namespace.
-      --audit-log-enabled             Emit OCSF AI inference audit events as JSON lines to stdout for authentication-protected requests.
-      --audit-use-forwarded-for       Trust X-Forwarded-For for audit source addresses. Enable only when the listener is reached through a trusted router.
+      --audit-ai-provider string          AI provider to include in audit events when a resource name is resolved.
+      --audit-log-enabled                 Emit OCSF AI inference audit events as JSON lines to stdout for authentication-protected requests.
+      --audit-resource-name string        Resource name to include in audit events. Falls back to authorization resourceAttributes.name.
+      --audit-resource-namespace string   Resource namespace to include in audit events. Falls back to authorization resourceAttributes.namespace.
+      --audit-resource-type string        OCSF resource type to include in audit events.
+      --audit-use-forwarded-for           Trust X-Forwarded-For for audit source addresses. Enable only when the listener is reached through a trusted router.
 
 Global flags:
 
@@ -108,11 +110,17 @@ Global flags:
 
 Set `--audit-log-enabled` to emit one [OCSF 1.9.0 API Activity](https://github.com/ocsf/ocsf-schema/blob/v1.9.0/events/application/api_activity.json) event with the `ai_operation` profile per authentication-protected request. Audit records are written as JSON lines to stdout; operational logs remain on stderr. Requests matching `--ignore-paths`, requests rejected by `--allow-paths`, and the separate proxy health endpoint are not audited.
 
-`--audit-isvc-name` and `--audit-isvc-namespace` identify the target InferenceService. Each missing value falls back to the corresponding request-specific value resolved from `authorization.resourceAttributes`; unresolved templates are omitted. Missing metadata does not prevent the proxy from starting or emitting a request event.
+Resource name and namespace are resolved independently. For each field, an explicit `--audit-resource-name` or `--audit-resource-namespace` value takes precedence, followed by the request-specific value resolved from `authorization.resourceAttributes`, and finally by the corresponding static `authorization.resourceAttributes` value when it does not contain a template delimiter. Missing metadata does not prevent the proxy from starting or emitting a request event. `--audit-resource-type` is optional and is included only when configured; it is not inferred from the Kubernetes resource attribute.
 
-By default, the TCP peer is recorded as the source. `--audit-use-forwarded-for` makes the rightmost syntactically valid `X-Forwarded-For` address the source and records the validated address chain. Because forwarded headers can be spoofed, enable this flag only when traffic can reach the listener exclusively through a trusted router. This matches OpenShift's default [Append forwarded-header policy](https://docs.redhat.com/en/documentation/openshift_container_platform/4.22/html/ingress_and_load_balancing/routes).
+For example, a KServe sidecar can identify its target with `--audit-resource-name=<name>`, `--audit-resource-namespace=<namespace>`, `--audit-resource-type=InferenceService`, and `--audit-ai-provider=KServe`. The OCSF `ai_model` field is emitted only when a resource name is resolved and `--audit-ai-provider` is nonempty.
+
+The event records the authenticated Kubernetes principal name, UID, and groups literally. Treat audit output as sensitive identity data and restrict access to stdout collection, storage, and downstream audit systems with appropriate access controls.
+
+By default, the TCP peer is recorded as the source. `--audit-use-forwarded-for` makes the rightmost syntactically valid `X-Forwarded-For` address the source and records the validated address chain. Enabling the flag is an explicit contract that traffic reaches the listener exclusively through a trusted router that appends the peer address; kube-rbac-proxy does not configure or discover trusted CIDRs. Without that deployment guarantee, clients can spoof forwarded headers. This contract matches OpenShift's default [Append forwarded-header policy](https://docs.redhat.com/en/documentation/openshift_container_platform/4.22/html/ingress_and_load_balancing/routes).
 
 Audit records contain request metadata and response metrics only. Bearer tokens, request and response bodies, query strings, cookies, and arbitrary headers are never recorded.
+
+`--upstream-timeout` limits how long kube-rbac-proxy waits for upstream response headers. After headers arrive, response-body streaming continues beyond that timeout until the stream completes, fails, or is canceled.
 
 ### How to update Go dependencies
 
