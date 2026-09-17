@@ -27,6 +27,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/felixge/httpsnoop"
 
@@ -81,23 +82,34 @@ type requestContext struct {
 }
 
 const (
-	defaultQueueSize  = 1024
-	maxAuditEventSize = 64 << 10
+	defaultQueueSize          = 1024
+	maxAuditEventSize         = 64 << 10
+	maxAuditPathSize          = 1024
+	maxAuditDynamicStringSize = 256
+	auditTruncationMarker     = "[truncated]"
 )
 
 // Logger queues OCSF events for a single writer goroutine. The bounded queue
 // prevents a slow audit sink from stalling request handlers. Events are
-// best-effort and are dropped when the queue is full.
+// best-effort; queue overflow is accumulated for direct writer reporting.
 type Logger struct {
-	encoder    *json.Encoder
-	options    Options
-	events     chan []byte
-	done       chan struct{}
-	stateMu    sync.RWMutex
-	closed     bool
-	closeOnce  sync.Once
-	dropped    atomic.Uint64
-	lastReport atomic.Int64
+	writer      io.Writer
+	options     Options
+	events      chan []byte
+	done        chan struct{}
+	stateMu     sync.RWMutex
+	closed      bool
+	closeOnce   sync.Once
+	dropped     atomic.Uint64
+	lastReport  atomic.Int64
+	lossMu      sync.Mutex
+	pendingLoss lossSnapshot
+}
+
+type lossSnapshot struct {
+	Count     int64
+	StartTime int64
+	EndTime   int64
 }
 
 func NewLogger(w io.Writer, options Options) *Logger {
@@ -108,10 +120,8 @@ func newLogger(w io.Writer, options Options, queueSize int) *Logger {
 	if options.ProductVersion == "" {
 		options.ProductVersion = "unknown"
 	}
-	encoder := json.NewEncoder(w)
-	encoder.SetEscapeHTML(false)
 	logger := &Logger{
-		encoder: encoder,
+		writer:  w,
 		options: options,
 		events:  make(chan []byte, queueSize),
 		done:    make(chan struct{}),
@@ -122,16 +132,98 @@ func newLogger(w io.Writer, options Options, queueSize int) *Logger {
 
 func (l *Logger) run() {
 	defer close(l.done)
-	for payload := range l.events {
+	for {
+		payload, ok := <-l.events
+		if !ok {
+			l.emitPendingLoss()
+			return
+		}
+		l.emitPendingLoss()
 		var event Event
 		if err := json.Unmarshal(payload, &event); err != nil {
 			l.report("failed to decode queued audit event", err)
 			continue
 		}
 		event.Metadata.LoggedTime = time.Now().UnixMilli()
-		if err := l.encoder.Encode(event); err != nil {
+		if err := l.encode(event); err != nil {
 			l.report("failed to write audit event", err)
 		}
+	}
+}
+
+func (l *Logger) emitPendingLoss() {
+	snapshot := l.takePendingLoss()
+	if snapshot.Count == 0 {
+		return
+	}
+	event := newGapEvent(snapshot, l.options.ProductVersion, time.Now().UnixMilli())
+	if err := l.encode(event); err != nil {
+		l.restorePendingLoss(snapshot)
+		l.report("failed to write audit event loss summary", err)
+	}
+}
+
+func (l *Logger) encode(event any) error {
+	encoder := json.NewEncoder(l.writer)
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(event)
+}
+
+func newGapEvent(snapshot lossSnapshot, productVersion string, loggedTime int64) gapEvent {
+	return gapEvent{
+		ActivityID:   gapActivityID,
+		ActivityName: gapActivityName,
+		CategoryUID:  gapCategoryUID,
+		CategoryName: gapCategoryName,
+		ClassUID:     gapClassUID,
+		ClassName:    gapClassName,
+		TypeUID:      gapTypeUID,
+		TypeName:     gapClassName + ": " + gapActivityName,
+		SeverityID:   gapSeverityID,
+		Severity:     gapSeverityName,
+		Time:         snapshot.StartTime,
+		StartTime:    snapshot.StartTime,
+		EndTime:      snapshot.EndTime,
+		Duration:     snapshot.EndTime - snapshot.StartTime,
+		Count:        snapshot.Count,
+		Metadata: gapMetadata{
+			Version: ocsfVersion,
+			Product: Product{
+				Name:    productName,
+				Version: productVersion,
+			},
+			LoggedTime: loggedTime,
+		},
+		StatusID:   statusFailureID,
+		Status:     statusFailureName,
+		StatusCode: gapStatusCode,
+	}
+}
+
+func (l *Logger) takePendingLoss() lossSnapshot {
+	l.lossMu.Lock()
+	defer l.lossMu.Unlock()
+	snapshot := l.pendingLoss
+	l.pendingLoss = lossSnapshot{}
+	return snapshot
+}
+
+func (l *Logger) restorePendingLoss(snapshot lossSnapshot) {
+	if snapshot.Count == 0 {
+		return
+	}
+	l.lossMu.Lock()
+	defer l.lossMu.Unlock()
+	if l.pendingLoss.Count == 0 {
+		l.pendingLoss = snapshot
+		return
+	}
+	l.pendingLoss.Count += snapshot.Count
+	if snapshot.StartTime < l.pendingLoss.StartTime {
+		l.pendingLoss.StartTime = snapshot.StartTime
+	}
+	if snapshot.EndTime > l.pendingLoss.EndTime {
+		l.pendingLoss.EndTime = snapshot.EndTime
 	}
 }
 
@@ -255,8 +347,16 @@ func (l *Logger) enqueue(event Event) {
 		return
 	}
 	if len(payload) > maxAuditEventSize {
-		l.drop("audit event exceeds maximum size; dropping event", nil)
-		return
+		event = boundedAuditEvent(event, len(payload))
+		payload, err = json.Marshal(event)
+		if err != nil {
+			l.drop("failed to serialize bounded audit event; dropping event", err)
+			return
+		}
+		if len(payload) > maxAuditEventSize {
+			l.report("bounded audit event exceeds maximum size; dropping event", nil)
+			return
+		}
 	}
 
 	l.stateMu.RLock()
@@ -267,8 +367,112 @@ func (l *Logger) enqueue(event Event) {
 	select {
 	case l.events <- payload:
 	default:
-		l.drop("audit event queue is full; dropping event", nil)
+		l.recordQueueLoss(time.Now().UnixMilli())
 	}
+}
+
+func boundedAuditEvent(event Event, originalSize int) Event {
+	bounded := Event{
+		ActivityID:   event.ActivityID,
+		ActivityName: truncateUTF8(event.ActivityName, maxAuditDynamicStringSize),
+		CategoryUID:  event.CategoryUID,
+		CategoryName: truncateUTF8(event.CategoryName, maxAuditDynamicStringSize),
+		ClassUID:     event.ClassUID,
+		ClassName:    truncateUTF8(event.ClassName, maxAuditDynamicStringSize),
+		TypeUID:      event.TypeUID,
+		SeverityID:   event.SeverityID,
+		Severity:     truncateUTF8(event.Severity, maxAuditDynamicStringSize),
+		Time:         event.Time,
+		Metadata: Metadata{
+			Version:         truncateUTF8(event.Metadata.Version, maxAuditDynamicStringSize),
+			Profiles:        []string{aiOperationProfile},
+			IsTruncated:     true,
+			UntruncatedSize: originalSize,
+			Product: Product{
+				Name:    truncateUTF8(event.Metadata.Product.Name, maxAuditDynamicStringSize),
+				Version: truncateUTF8(event.Metadata.Product.Version, maxAuditDynamicStringSize),
+			},
+		},
+		Actor: Actor{User: User{
+			Name:   truncateUTF8(event.Actor.User.Name, maxAuditDynamicStringSize),
+			UID:    truncateUTF8(event.Actor.User.UID, maxAuditDynamicStringSize),
+			TypeID: event.Actor.User.TypeID,
+		}},
+		API: API{Operation: truncateUTF8(event.API.Operation, maxAuditDynamicStringSize)},
+		HTTPRequest: HTTPRequest{
+			HTTPMethod: truncateUTF8(event.HTTPRequest.HTTPMethod, maxAuditDynamicStringSize),
+			Version:    truncateUTF8(event.HTTPRequest.Version, maxAuditDynamicStringSize),
+			URL:        URL{Path: truncateUTF8(event.HTTPRequest.URL.Path, maxAuditPathSize)},
+		},
+		HTTPResponse: event.HTTPResponse,
+		SrcEndpoint: Endpoint{
+			Name:     truncateUTF8(event.SrcEndpoint.Name, maxAuditDynamicStringSize),
+			Hostname: truncateUTF8(event.SrcEndpoint.Hostname, maxAuditDynamicStringSize),
+			IP:       truncateUTF8(event.SrcEndpoint.IP, maxAuditDynamicStringSize),
+			Port:     event.SrcEndpoint.Port,
+		},
+		StatusID:   event.StatusID,
+		Status:     truncateUTF8(event.Status, maxAuditDynamicStringSize),
+		StatusCode: truncateUTF8(event.StatusCode, maxAuditDynamicStringSize),
+	}
+	if event.DstEndpoint != nil {
+		bounded.DstEndpoint = &Endpoint{
+			Name:     truncateUTF8(event.DstEndpoint.Name, maxAuditDynamicStringSize),
+			Hostname: truncateUTF8(event.DstEndpoint.Hostname, maxAuditDynamicStringSize),
+			IP:       truncateUTF8(event.DstEndpoint.IP, maxAuditDynamicStringSize),
+			Port:     event.DstEndpoint.Port,
+		}
+	}
+	if len(event.Resources) > 0 {
+		resource := event.Resources[0]
+		bounded.Resources = []Resource{{
+			Name:      truncateUTF8(resource.Name, maxAuditDynamicStringSize),
+			Namespace: truncateUTF8(resource.Namespace, maxAuditDynamicStringSize),
+			Type:      truncateUTF8(resource.Type, maxAuditDynamicStringSize),
+			RoleID:    resource.RoleID,
+			Role:      truncateUTF8(resource.Role, maxAuditDynamicStringSize),
+		}}
+	}
+	if event.AIModel != nil {
+		bounded.AIModel = &AIModel{
+			Name:       truncateUTF8(event.AIModel.Name, maxAuditDynamicStringSize),
+			AIProvider: truncateUTF8(event.AIModel.AIProvider, maxAuditDynamicStringSize),
+		}
+	}
+	return bounded
+}
+
+func truncateUTF8(value string, limit int) string {
+	value = strings.ToValidUTF8(value, "\uFFFD")
+	if len(value) <= limit {
+		return value
+	}
+	contentLimit := limit - len(auditTruncationMarker)
+	if contentLimit < 0 {
+		contentLimit = 0
+	}
+	cutoff := 0
+	for cutoff < len(value) {
+		_, size := utf8.DecodeRuneInString(value[cutoff:])
+		if cutoff+size > contentLimit {
+			break
+		}
+		cutoff += size
+	}
+	return value[:cutoff] + auditTruncationMarker
+}
+
+func (l *Logger) recordQueueLoss(timestamp int64) {
+	l.lossMu.Lock()
+	if l.pendingLoss.Count == 0 {
+		l.pendingLoss.StartTime = timestamp
+	}
+	l.pendingLoss.Count++
+	l.pendingLoss.EndTime = timestamp
+	l.lossMu.Unlock()
+
+	l.dropped.Add(1)
+	l.report("audit event queue is full; dropping event", nil)
 }
 
 func (l *Logger) drop(message string, err error) {

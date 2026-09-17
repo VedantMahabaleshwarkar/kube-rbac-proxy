@@ -33,6 +33,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -270,18 +271,33 @@ func TestResponseHeaderTimeoutRoundTripErrorCancelsChildContext(t *testing.T) {
 }
 
 func TestResponseHeaderTimeoutPreservesParentCancellation(t *testing.T) {
-	timeout := 100 * time.Millisecond
+	timeout := 30 * time.Second
 	parentErr := errors.New("parent request canceled")
 	started := make(chan struct{})
 	observedParentCancellation := make(chan error, 1)
+	releaseRoundTrip := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseRoundTrip) }) }
+	defer release()
 	next := &stubRoundTripper{roundTrip: func(req *http.Request) (*http.Response, error) {
 		close(started)
 		<-req.Context().Done()
 		cause := context.Cause(req.Context())
 		observedParentCancellation <- cause
-		time.Sleep(2 * timeout)
+		<-releaseRoundTrip
 		return nil, cause
 	}}
+	timerCallback := make(chan func(), 1)
+	testTimer := time.NewTimer(time.Hour)
+	defer testTimer.Stop()
+	roundTripper := &responseHeaderTimeoutRoundTripper{
+		next:    next,
+		timeout: timeout,
+		afterFunc: func(_ time.Duration, callback func()) *time.Timer {
+			timerCallback <- callback
+			return testTimer
+		},
+	}
 
 	ctx, cancel := context.WithCancelCause(context.Background())
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://upstream.example", nil)
@@ -290,7 +306,7 @@ func TestResponseHeaderTimeoutPreservesParentCancellation(t *testing.T) {
 	}
 	result := make(chan error, 1)
 	go func() {
-		_, err := withResponseHeaderTimeout(next, timeout).RoundTrip(req)
+		_, err := roundTripper.RoundTrip(req)
 		result <- err
 	}()
 
@@ -304,6 +320,8 @@ func TestResponseHeaderTimeoutPreservesParentCancellation(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("transport did not observe parent cancellation")
 	}
+	(<-timerCallback)()
+	release()
 	select {
 	case err := <-result:
 		if err != parentErr {

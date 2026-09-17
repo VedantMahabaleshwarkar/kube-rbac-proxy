@@ -1,0 +1,28 @@
+{
+  "activity_id": 99,
+  "activity_name": "Audit Event Loss",
+  "category_uid": 0,
+  "category_name": "Uncategorized",
+  "class_uid": 0,
+  "class_name": "Base Event",
+  "type_uid": 99,
+  "type_name": "Base Event: Audit Event Loss",
+  "severity_id": 3,
+  "severity": "Medium",
+  "time": 1700000000000,
+  "start_time": 1700000000000,
+  "end_time": 1700000000250,
+  "duration": 250,
+  "count": 3,
+  "metadata": {
+    "version": "1.9.0",
+    "product": {
+      "name": "kube-rbac-proxy",
+      "version": "v0.21.0"
+    },
+    "logged_time": 1700000000500
+  },
+  "status_id": 2,
+  "status": "Failure",
+  "status_code": "audit_queue_full"
+}

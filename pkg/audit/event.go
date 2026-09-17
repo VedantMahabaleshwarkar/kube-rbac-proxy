@@ -40,6 +40,17 @@ const (
 
 	resourceRoleTargetID   = 1
 	resourceRoleTargetName = "Target"
+
+	gapActivityID   = 99
+	gapActivityName = "Audit Event Loss"
+	gapCategoryUID  = 0
+	gapCategoryName = "Uncategorized"
+	gapClassUID     = 0
+	gapClassName    = "Base Event"
+	gapTypeUID      = 99
+	gapSeverityID   = 3
+	gapSeverityName = "Medium"
+	gapStatusCode   = "audit_queue_full"
 )
 
 // Event is an OCSF 1.9.0 API Activity event with the AI Operation profile.
@@ -69,11 +80,43 @@ type Event struct {
 	AIModel      *AIModel     `json:"ai_model,omitempty"`
 }
 
+// gapEvent is an OCSF 1.9.0 Base Event that summarizes request audit
+// records lost while the bounded writer queue was full.
+type gapEvent struct {
+	ActivityID   int         `json:"activity_id"`
+	ActivityName string      `json:"activity_name"`
+	CategoryUID  int         `json:"category_uid"`
+	CategoryName string      `json:"category_name"`
+	ClassUID     int         `json:"class_uid"`
+	ClassName    string      `json:"class_name"`
+	TypeUID      int         `json:"type_uid"`
+	TypeName     string      `json:"type_name"`
+	SeverityID   int         `json:"severity_id"`
+	Severity     string      `json:"severity"`
+	Time         int64       `json:"time"`
+	StartTime    int64       `json:"start_time"`
+	EndTime      int64       `json:"end_time"`
+	Duration     int64       `json:"duration"`
+	Count        int64       `json:"count"`
+	Metadata     gapMetadata `json:"metadata"`
+	StatusID     int         `json:"status_id"`
+	Status       string      `json:"status"`
+	StatusCode   string      `json:"status_code"`
+}
+
+type gapMetadata struct {
+	Version    string  `json:"version"`
+	Product    Product `json:"product"`
+	LoggedTime int64   `json:"logged_time"`
+}
+
 type Metadata struct {
-	Version    string   `json:"version"`
-	Profiles   []string `json:"profiles"`
-	Product    Product  `json:"product"`
-	LoggedTime int64    `json:"logged_time"`
+	Version         string   `json:"version"`
+	Profiles        []string `json:"profiles"`
+	Product         Product  `json:"product"`
+	LoggedTime      int64    `json:"logged_time"`
+	IsTruncated     bool     `json:"is_truncated,omitempty"`
+	UntruncatedSize int      `json:"untruncated_size,omitempty"`
 }
 
 type Product struct {

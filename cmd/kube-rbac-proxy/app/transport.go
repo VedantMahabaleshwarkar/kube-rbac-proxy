@@ -32,8 +32,9 @@ import (
 var errResponseHeaderTimeout = errors.New("response header timeout")
 
 type responseHeaderTimeoutRoundTripper struct {
-	next    http.RoundTripper
-	timeout time.Duration
+	next      http.RoundTripper
+	timeout   time.Duration
+	afterFunc func(time.Duration, func()) *time.Timer
 }
 
 func withResponseHeaderTimeout(next http.RoundTripper, timeout time.Duration) http.RoundTripper {
@@ -53,7 +54,11 @@ func (r *responseHeaderTimeoutRoundTripper) RoundTrip(req *http.Request) (*http.
 	var mu sync.Mutex
 	completed := false
 	timedOut := false
-	timer := time.AfterFunc(r.timeout, func() {
+	afterFunc := r.afterFunc
+	if afterFunc == nil {
+		afterFunc = time.AfterFunc
+	}
+	timer := afterFunc(r.timeout, func() {
 		mu.Lock()
 		defer mu.Unlock()
 		if completed {

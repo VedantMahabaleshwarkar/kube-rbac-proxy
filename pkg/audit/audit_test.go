@@ -31,6 +31,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/felixge/httpsnoop"
 	"github.com/google/go-cmp/cmp"
@@ -167,6 +168,30 @@ func TestEventContract(t *testing.T) {
 	}
 	if diff := cmp.Diff(compactGolden.String(), string(encoded)); diff != "" {
 		t.Errorf("golden event mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestAuditGapEventContract(t *testing.T) {
+	event := newGapEvent(lossSnapshot{
+		Count:     3,
+		StartTime: 1_700_000_000_000,
+		EndTime:   1_700_000_000_250,
+	}, "v0.21.0", 1_700_000_000_500)
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	golden, err := os.ReadFile("testdata/audit-gap.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var compactGolden bytes.Buffer
+	if err := json.Compact(&compactGolden, golden); err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(compactGolden.String(), string(encoded)); diff != "" {
+		t.Errorf("golden gap event mismatch (-want +got):\n%s", diff)
 	}
 }
 
@@ -351,36 +376,249 @@ func TestConcurrentJSONLinesDoNotInterleave(t *testing.T) {
 	}
 }
 
-func TestOversizedAuditEventIsDroppedBeforeQueueing(t *testing.T) {
+func TestOversizedAuditEventIsEmittedAsBoundedFallback(t *testing.T) {
 	var output bytes.Buffer
-	logger := NewLogger(&output, Options{ProductVersion: "test"})
-	handler := logger.WithAuditLog(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
+	upstream, err := url.Parse("https://192.0.2.200:9443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := NewLogger(&output, Options{
+		Resource:       ResourceMetadata{Name: "fraud-detector", Namespace: "models", Type: "InferenceService"},
+		AIProvider:     "KServe",
+		UpstreamURL:    upstream,
+		ProductVersion: "test",
 	})
 
-	oversizedPath := "/" + strings.Repeat("a", 128<<10)
-	oversizedReq := httptest.NewRequest(http.MethodPost, "http://proxy"+oversizedPath, nil)
-	oversizedReq.RemoteAddr = "192.0.2.3:8080"
-	handler(httptest.NewRecorder(), oversizedReq)
+	oversizedPath := "/" + strings.Repeat("\u00e9\\\"", 32<<10)
+	target := (&url.URL{Scheme: "http", Host: "proxy", Path: oversizedPath}).String()
+	req := httptest.NewRequest(http.MethodPost, target, nil)
+	req.Proto = "HTTP/2.0"
+	req.RemoteAddr = "192.0.2.3:8080"
+	event := logger.event(req, &requestContext{user: &user.DefaultInfo{
+		Name:   "system:serviceaccount:models:client",
+		UID:    "uid-123",
+		Groups: []string{"system:serviceaccounts", "models-readers"},
+	}}, httpsnoop.Metrics{
+		Code:     http.StatusForbidden,
+		Duration: 1500 * time.Millisecond,
+		Written:  27,
+	}, time.Unix(1_700_000_000, 123_000_000))
+	event.HTTPRequest.XForwardedFor = []string{"198.51.100.4", "2001:db8::5"}
+	fullPayload, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fullPayload) <= maxAuditEventSize {
+		t.Fatalf("full audit payload size = %d, want > %d", len(fullPayload), maxAuditEventSize)
+	}
 
-	normalReq := httptest.NewRequest(http.MethodPost, "http://proxy/infer", nil)
-	normalReq.RemoteAddr = "192.0.2.3:8080"
-	handler(httptest.NewRecorder(), normalReq)
+	logger.enqueue(event)
 	closeLogger(t, logger)
 
-	if got := logger.dropped.Load(); got != 1 {
-		t.Fatalf("dropped events = %d, want 1", got)
+	if got := logger.dropped.Load(); got != 0 {
+		t.Fatalf("dropped events = %d, want 0", got)
 	}
+	payload := bytes.TrimSuffix(output.Bytes(), []byte("\n"))
+	if len(payload) > maxAuditEventSize {
+		t.Fatalf("bounded audit payload size = %d, want <= %d", len(payload), maxAuditEventSize)
+	}
+	if !utf8.Valid(payload) {
+		t.Fatal("bounded audit payload is not valid UTF-8")
+	}
+	var document struct {
+		Metadata map[string]any `json:"metadata"`
+		Unmapped map[string]any `json:"unmapped"`
+	}
+	if err := json.Unmarshal(payload, &document); err != nil {
+		t.Fatalf("decode bounded audit document: %v", err)
+	}
+	if truncated, ok := document.Metadata["is_truncated"].(bool); !ok || !truncated {
+		t.Errorf("metadata.is_truncated = %#v, want true", document.Metadata["is_truncated"])
+	}
+	if originalSize, ok := document.Metadata["untruncated_size"].(float64); !ok || int(originalSize) != len(fullPayload) {
+		t.Errorf("metadata.untruncated_size = %#v, want %d", document.Metadata["untruncated_size"], len(fullPayload))
+	}
+	if document.Unmapped != nil {
+		t.Errorf("bounded audit unmapped data = %#v, want omitted", document.Unmapped)
+	}
+
 	decoder := json.NewDecoder(&output)
-	var event Event
-	if err := decoder.Decode(&event); err != nil {
-		t.Fatalf("decode retained audit event: %v", err)
-	}
-	if event.HTTPRequest.URL.Path != "/infer" {
-		t.Errorf("retained audit path = %q, want /infer", event.HTTPRequest.URL.Path)
+	var got Event
+	if err := decoder.Decode(&got); err != nil {
+		t.Fatalf("decode bounded audit event: %v", err)
 	}
 	if err := decoder.Decode(&Event{}); err != io.EOF {
-		t.Fatalf("expected exactly one retained audit event, got trailing decode error %v", err)
+		t.Fatalf("expected exactly one bounded audit event, got trailing decode error %v", err)
+	}
+
+	if got.ClassUID != classUID || got.ClassName != className || got.Time != event.Time {
+		t.Errorf("classification/time not preserved: class=%d/%q time=%d", got.ClassUID, got.ClassName, got.Time)
+	}
+	wantUser := User{Name: "system:serviceaccount:models:client", UID: "uid-123", TypeID: 4}
+	if diff := cmp.Diff(wantUser, got.Actor.User); diff != "" {
+		t.Errorf("bounded user mismatch (-want +got):\n%s", diff)
+	}
+	wantResources := []Resource{{Name: "fraud-detector", Namespace: "models", Type: "InferenceService", RoleID: 1, Role: "Target"}}
+	if diff := cmp.Diff(wantResources, got.Resources); diff != "" {
+		t.Errorf("bounded resources mismatch (-want +got):\n%s", diff)
+	}
+	if got.HTTPRequest.HTTPMethod != http.MethodPost || got.HTTPRequest.Version != "2.0" {
+		t.Errorf("bounded HTTP method/version = %q/%q, want POST/2.0", got.HTTPRequest.HTTPMethod, got.HTTPRequest.Version)
+	}
+	if got.SrcEndpoint.IP != "192.0.2.3" || got.SrcEndpoint.Port != 8080 {
+		t.Errorf("bounded source endpoint = %+v, want 192.0.2.3:8080", got.SrcEndpoint)
+	}
+	if diff := cmp.Diff(event.HTTPResponse, got.HTTPResponse); diff != "" {
+		t.Errorf("bounded response metrics mismatch (-want +got):\n%s", diff)
+	}
+	if got.StatusID != statusFailureID || got.Status != statusFailureName || got.StatusCode != "403" {
+		t.Errorf("bounded outcome = %d/%q/%q, want 2/Failure/403", got.StatusID, got.Status, got.StatusCode)
+	}
+	if len(got.HTTPRequest.URL.Path) > 1024 || !utf8.ValidString(got.HTTPRequest.URL.Path) || !strings.HasSuffix(got.HTTPRequest.URL.Path, "[truncated]") {
+		t.Errorf("bounded path is not a valid marked 1024-byte value: bytes=%d suffix=%t", len(got.HTTPRequest.URL.Path), strings.HasSuffix(got.HTTPRequest.URL.Path, "[truncated]"))
+	}
+	if len(got.API.Operation) > 256 || !utf8.ValidString(got.API.Operation) || !strings.HasSuffix(got.API.Operation, "[truncated]") {
+		t.Errorf("bounded operation is not a valid marked 256-byte value: bytes=%d suffix=%t", len(got.API.Operation), strings.HasSuffix(got.API.Operation, "[truncated]"))
+	}
+	if got.Actor.User.Groups != nil || got.HTTPRequest.XForwardedFor != nil {
+		t.Errorf("high-cardinality fallback fields were retained: groups=%v forwarded=%v", got.Actor.User.Groups, got.HTTPRequest.XForwardedFor)
+	}
+	wantDstEndpoint := &Endpoint{IP: "192.0.2.200", Port: 9443}
+	if diff := cmp.Diff(wantDstEndpoint, got.DstEndpoint); diff != "" {
+		t.Errorf("bounded destination endpoint mismatch (-want +got):\n%s", diff)
+	}
+	wantAIModel := &AIModel{Name: "fraud-detector", AIProvider: "KServe"}
+	if diff := cmp.Diff(wantAIModel, got.AIModel); diff != "" {
+		t.Errorf("bounded AI model mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestTruncateUTF8KeepsMarkerWithinByteLimit(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		limit int
+	}{
+		{name: "multibyte path", value: strings.Repeat("\u00e9", 600), limit: 1024},
+		{name: "JSON escaping", value: strings.Repeat("\\\"", 200), limit: 256},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := truncateUTF8(tt.value, tt.limit)
+			if len(got) > tt.limit {
+				t.Fatalf("truncated bytes = %d, want <= %d", len(got), tt.limit)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("truncated value is not valid UTF-8: %q", got)
+			}
+			if !strings.HasSuffix(got, "[truncated]") {
+				t.Fatalf("truncated value %q does not contain the marker within its limit", got)
+			}
+			prefix := strings.TrimSuffix(got, "[truncated]")
+			if !strings.HasPrefix(tt.value, prefix) {
+				t.Fatalf("truncated prefix %q is not a prefix of the input", prefix)
+			}
+			encoded, err := json.Marshal(got)
+			if err != nil {
+				t.Fatalf("marshal truncated value: %v", err)
+			}
+			var roundTrip string
+			if err := json.Unmarshal(encoded, &roundTrip); err != nil {
+				t.Fatalf("unmarshal truncated value: %v", err)
+			}
+			if roundTrip != got {
+				t.Fatalf("JSON round trip = %q, want %q", roundTrip, got)
+			}
+		})
+	}
+}
+
+func TestBoundedAuditEventCapsEveryRetainedDynamicString(t *testing.T) {
+	longDynamic := strings.Repeat("\u00e9\\\"", 300)
+	longPath := "/" + strings.Repeat("\u00e9\\\"", 600)
+	event := Event{
+		ActivityName: longDynamic,
+		CategoryName: longDynamic,
+		ClassName:    longDynamic,
+		Severity:     longDynamic,
+		Metadata: Metadata{
+			Version:  longDynamic,
+			Profiles: []string{longDynamic},
+			Product:  Product{Name: longDynamic, Version: longDynamic},
+		},
+		Actor: Actor{User: User{Name: longDynamic, UID: longDynamic, Groups: []Group{{Name: longDynamic}}}},
+		API:   API{Operation: longDynamic},
+		HTTPRequest: HTTPRequest{
+			HTTPMethod:    longDynamic,
+			Version:       longDynamic,
+			URL:           URL{Path: longPath},
+			XForwardedFor: []string{longDynamic},
+		},
+		SrcEndpoint: Endpoint{Name: longDynamic, Hostname: longDynamic, IP: longDynamic},
+		DstEndpoint: &Endpoint{Name: longDynamic, Hostname: longDynamic, IP: longDynamic},
+		Status:      longDynamic,
+		StatusCode:  longDynamic,
+		Resources: []Resource{{
+			Name: longDynamic, Namespace: longDynamic, Type: longDynamic, Role: longDynamic,
+		}},
+		AIModel: &AIModel{Name: longDynamic, AIProvider: longDynamic},
+	}
+
+	got := boundedAuditEvent(event, 128<<10)
+	if diff := cmp.Diff([]string{aiOperationProfile}, got.Metadata.Profiles); diff != "" {
+		t.Errorf("bounded profiles mismatch (-want +got):\n%s", diff)
+	}
+	if got.Actor.User.Groups != nil || got.HTTPRequest.XForwardedFor != nil {
+		t.Errorf("fallback-only omissions were retained: groups=%v forwarded=%v", got.Actor.User.Groups, got.HTTPRequest.XForwardedFor)
+	}
+	if got.DstEndpoint == nil {
+		t.Fatal("bounded destination endpoint is nil")
+	}
+	if got.AIModel == nil {
+		t.Fatal("bounded AI model is nil")
+	}
+	retained := map[string]string{
+		"activity_name":      got.ActivityName,
+		"category_name":      got.CategoryName,
+		"class_name":         got.ClassName,
+		"severity":           got.Severity,
+		"metadata.version":   got.Metadata.Version,
+		"product.name":       got.Metadata.Product.Name,
+		"product.version":    got.Metadata.Product.Version,
+		"user.name":          got.Actor.User.Name,
+		"user.uid":           got.Actor.User.UID,
+		"api.operation":      got.API.Operation,
+		"http_method":        got.HTTPRequest.HTTPMethod,
+		"http_version":       got.HTTPRequest.Version,
+		"src.name":           got.SrcEndpoint.Name,
+		"src.hostname":       got.SrcEndpoint.Hostname,
+		"src.ip":             got.SrcEndpoint.IP,
+		"dst.name":           got.DstEndpoint.Name,
+		"dst.hostname":       got.DstEndpoint.Hostname,
+		"dst.ip":             got.DstEndpoint.IP,
+		"status":             got.Status,
+		"status_code":        got.StatusCode,
+		"resource.name":      got.Resources[0].Name,
+		"resource.namespace": got.Resources[0].Namespace,
+		"resource.type":      got.Resources[0].Type,
+		"resource.role":      got.Resources[0].Role,
+		"ai_model.name":      got.AIModel.Name,
+		"ai_model.provider":  got.AIModel.AIProvider,
+	}
+	for name, value := range retained {
+		if len(value) > 256 || !utf8.ValidString(value) || !strings.HasSuffix(value, "[truncated]") {
+			t.Errorf("%s is not a valid marked 256-byte value: bytes=%d suffix=%t", name, len(value), strings.HasSuffix(value, "[truncated]"))
+		}
+	}
+	if len(got.HTTPRequest.URL.Path) > 1024 || !utf8.ValidString(got.HTTPRequest.URL.Path) || !strings.HasSuffix(got.HTTPRequest.URL.Path, "[truncated]") {
+		t.Errorf("path is not a valid marked 1024-byte value: bytes=%d suffix=%t", len(got.HTTPRequest.URL.Path), strings.HasSuffix(got.HTTPRequest.URL.Path, "[truncated]"))
+	}
+	payload, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload) > maxAuditEventSize {
+		t.Fatalf("worst-case bounded payload size = %d, want <= %d", len(payload), maxAuditEventSize)
 	}
 }
 
@@ -568,6 +806,85 @@ func (w *blockingWriter) Bytes() []byte {
 	return w.buffer.Bytes()
 }
 
+type auditWriteAttempt struct {
+	payload []byte
+	result  chan error
+}
+
+func (a *auditWriteAttempt) finish(err error) {
+	a.result <- err
+}
+
+type controlledWriter struct {
+	attempts  chan *auditWriteAttempt
+	abort     chan struct{}
+	abortOnce sync.Once
+}
+
+func newControlledWriter() *controlledWriter {
+	return &controlledWriter{
+		attempts: make(chan *auditWriteAttempt, 32),
+		abort:    make(chan struct{}),
+	}
+}
+
+func (w *controlledWriter) Write(p []byte) (int, error) {
+	attempt := &auditWriteAttempt{
+		payload: append([]byte(nil), p...),
+		result:  make(chan error, 1),
+	}
+	select {
+	case w.attempts <- attempt:
+	case <-w.abort:
+		return len(p), nil
+	}
+	select {
+	case err := <-attempt.result:
+		if err != nil {
+			return 0, err
+		}
+		return len(p), nil
+	case <-w.abort:
+		return len(p), nil
+	}
+}
+
+func (w *controlledWriter) stop() {
+	w.abortOnce.Do(func() { close(w.abort) })
+}
+
+func nextAuditWrite(t *testing.T, writer *controlledWriter) *auditWriteAttempt {
+	t.Helper()
+	select {
+	case attempt := <-writer.attempts:
+		return attempt
+	case <-time.After(time.Second):
+		t.Fatal("audit writer did not attempt the expected write")
+		return nil
+	}
+}
+
+type decodedAuditRecord struct {
+	ClassUID     int         `json:"class_uid"`
+	ActivityName string      `json:"activity_name"`
+	Time         int64       `json:"time"`
+	StartTime    int64       `json:"start_time"`
+	EndTime      int64       `json:"end_time"`
+	Duration     int64       `json:"duration"`
+	Count        int64       `json:"count"`
+	Metadata     Metadata    `json:"metadata"`
+	HTTPRequest  HTTPRequest `json:"http_request"`
+}
+
+func decodeAuditWrite(t *testing.T, attempt *auditWriteAttempt) decodedAuditRecord {
+	t.Helper()
+	var record decodedAuditRecord
+	if err := json.Unmarshal(attempt.payload, &record); err != nil {
+		t.Fatalf("decode audit write: %v", err)
+	}
+	return record
+}
+
 func TestLoggerCloseDrainsQueuedEvents(t *testing.T) {
 	var output bytes.Buffer
 	logger := newLogger(&output, Options{ProductVersion: "test"}, 4)
@@ -669,41 +986,165 @@ func TestLoggerCloseDeadlineCanBeRetried(t *testing.T) {
 	closeLogger(t, logger)
 }
 
-func TestSlowWriterDoesNotBlockRequestHandlers(t *testing.T) {
-	writer := &blockingWriter{started: make(chan struct{}), release: make(chan struct{})}
+func TestQueueLossIsAggregatedBetweenNormalEventsWithoutBlockingRequests(t *testing.T) {
+	writer := newControlledWriter()
 	logger := newLogger(writer, Options{ProductVersion: "test"}, 1)
+	t.Cleanup(func() {
+		writer.stop()
+		closeLogger(t, logger)
+	})
 	handler := logger.WithAuditLog(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	request := func() {
-		req := httptest.NewRequest(http.MethodPost, "http://proxy/infer", nil)
+	request := func(path string) {
+		req := httptest.NewRequest(http.MethodPost, "http://proxy"+path, nil)
 		req.RemoteAddr = "192.0.2.7:8080"
 		handler(httptest.NewRecorder(), req)
 	}
 
-	request()
-	select {
-	case <-writer.started:
-	case <-time.After(time.Second):
-		t.Fatal("audit writer did not receive the first event")
+	request("/first")
+	first := nextAuditWrite(t, writer)
+	if got := decodeAuditWrite(t, first).HTTPRequest.URL.Path; got != "/first" {
+		t.Fatalf("first audit path = %q, want /first", got)
 	}
-	request()
+	request("/queued")
+
+	firstLossWindowStart := time.Now().UnixMilli()
 	done := make(chan struct{})
 	go func() {
-		request()
+		request("/dropped-1")
+		request("/dropped-2")
+		request("/dropped-3")
 		close(done)
 	}()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("request blocked on a saturated audit queue")
+		t.Fatal("requests blocked on a saturated audit queue")
+	}
+	firstLossWindowEnd := time.Now().UnixMilli()
+	if got := logger.dropped.Load(); got != 3 {
+		t.Fatalf("dropped events = %d, want 3", got)
+	}
+	first.finish(nil)
+
+	firstGapAttempt := nextAuditWrite(t, writer)
+	firstGap := decodeAuditWrite(t, firstGapAttempt)
+	if firstGap.ClassUID != 0 || firstGap.ActivityName != "Audit Event Loss" || firstGap.Count != 3 {
+		t.Fatalf("first gap = class %d activity %q count %d, want Base Event loss count 3", firstGap.ClassUID, firstGap.ActivityName, firstGap.Count)
+	}
+	if firstGap.Time != firstGap.StartTime || firstGap.Duration != firstGap.EndTime-firstGap.StartTime {
+		t.Errorf("first gap time range is inconsistent: time=%d start=%d end=%d duration=%d", firstGap.Time, firstGap.StartTime, firstGap.EndTime, firstGap.Duration)
+	}
+	if firstGap.StartTime < firstLossWindowStart || firstGap.EndTime > firstLossWindowEnd {
+		t.Errorf("first gap window [%d,%d] falls outside request window [%d,%d]", firstGap.StartTime, firstGap.EndTime, firstLossWindowStart, firstLossWindowEnd)
+	}
+	firstGapAttempt.finish(nil)
+
+	queuedAttempt := nextAuditWrite(t, writer)
+	if got := decodeAuditWrite(t, queuedAttempt).HTTPRequest.URL.Path; got != "/queued" {
+		t.Fatalf("queued audit path = %q, want /queued", got)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	request("/queued-later")
+	secondLossWindowStart := time.Now().UnixMilli()
+	request("/dropped-later-1")
+	request("/dropped-later-2")
+	secondLossWindowEnd := time.Now().UnixMilli()
+	if got := logger.dropped.Load(); got != 5 {
+		t.Fatalf("cumulative dropped events = %d, want 5", got)
+	}
+	queuedAttempt.finish(nil)
+
+	secondGapAttempt := nextAuditWrite(t, writer)
+	secondGap := decodeAuditWrite(t, secondGapAttempt)
+	if secondGap.ClassUID != 0 || secondGap.ActivityName != "Audit Event Loss" || secondGap.Count != 2 {
+		t.Fatalf("second gap = class %d activity %q count %d, want Base Event loss count 2", secondGap.ClassUID, secondGap.ActivityName, secondGap.Count)
+	}
+	if secondGap.StartTime < secondLossWindowStart || secondGap.EndTime > secondLossWindowEnd {
+		t.Errorf("second gap window [%d,%d] falls outside request window [%d,%d]", secondGap.StartTime, secondGap.EndTime, secondLossWindowStart, secondLossWindowEnd)
+	}
+	secondGapAttempt.finish(nil)
+
+	laterAttempt := nextAuditWrite(t, writer)
+	if got := decodeAuditWrite(t, laterAttempt).HTTPRequest.URL.Path; got != "/queued-later" {
+		t.Fatalf("later queued audit path = %q, want /queued-later", got)
+	}
+	laterAttempt.finish(nil)
+
+	closeLogger(t, logger)
+	writer.stop()
+}
+
+func TestFailedGapWriteIsRetriedBeforeALaterEventAndAtShutdown(t *testing.T) {
+	writer := newControlledWriter()
+	logger := newLogger(writer, Options{ProductVersion: "test"}, 1)
+	t.Cleanup(func() {
+		writer.stop()
+		closeLogger(t, logger)
+	})
+	handler := logger.WithAuditLog(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	request := func(path string) {
+		req := httptest.NewRequest(http.MethodPost, "http://proxy"+path, nil)
+		req.RemoteAddr = "192.0.2.7:8080"
+		handler(httptest.NewRecorder(), req)
+	}
+
+	request("/first")
+	first := nextAuditWrite(t, writer)
+	request("/queued")
+	request("/dropped")
+	first.finish(nil)
+
+	failedGapAttempt := nextAuditWrite(t, writer)
+	failedGap := decodeAuditWrite(t, failedGapAttempt)
+	if failedGap.ClassUID != 0 || failedGap.Count != 1 {
+		t.Fatalf("failed gap = class %d count %d, want Base Event count 1", failedGap.ClassUID, failedGap.Count)
+	}
+	failedGapAttempt.finish(errors.New("gap sink failure"))
+
+	queuedAttempt := nextAuditWrite(t, writer)
+	if got := decodeAuditWrite(t, queuedAttempt).HTTPRequest.URL.Path; got != "/queued" {
+		t.Fatalf("write after failed gap = %q, want queued request before retry", got)
+	}
+	request("/later")
+	queuedAttempt.finish(nil)
+
+	retriedGapAttempt := nextAuditWrite(t, writer)
+	retriedGap := decodeAuditWrite(t, retriedGapAttempt)
+	if retriedGap.ClassUID != 0 || retriedGap.Count != failedGap.Count || retriedGap.Time != failedGap.Time || retriedGap.StartTime != failedGap.StartTime || retriedGap.EndTime != failedGap.EndTime || retriedGap.Duration != failedGap.Duration {
+		t.Fatalf("retried gap did not preserve the failed snapshot: failed=%+v retried=%+v", failedGap, retriedGap)
+	}
+	retriedGapAttempt.finish(errors.New("gap sink failure again"))
+
+	laterAttempt := nextAuditWrite(t, writer)
+	if got := decodeAuditWrite(t, laterAttempt).HTTPRequest.URL.Path; got != "/later" {
+		t.Fatalf("write after retried gap = %q, want later request before shutdown retry", got)
+	}
+	laterAttempt.finish(nil)
+
+	closeResult := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		closeResult <- logger.Close(ctx)
+	}()
+	finalGapAttempt := nextAuditWrite(t, writer)
+	finalGap := decodeAuditWrite(t, finalGapAttempt)
+	if finalGap.ClassUID != 0 || finalGap.Count != failedGap.Count || finalGap.Time != failedGap.Time || finalGap.StartTime != failedGap.StartTime || finalGap.EndTime != failedGap.EndTime || finalGap.Duration != failedGap.Duration {
+		t.Fatalf("shutdown gap did not preserve the failed snapshot: failed=%+v final=%+v", failedGap, finalGap)
+	}
+	finalGapAttempt.finish(nil)
+	if err := <-closeResult; err != nil {
+		t.Fatalf("close audit logger: %v", err)
 	}
 	if got := logger.dropped.Load(); got != 1 {
 		t.Fatalf("dropped events = %d, want 1", got)
 	}
-
-	close(writer.release)
-	closeLogger(t, logger)
+	writer.stop()
 }
 
 func TestLoggedTimeIsAssignedAtWriterBoundary(t *testing.T) {
