@@ -81,6 +81,7 @@ Kube-rbac-proxy flags:
       --secure-listen-address string                The address the kube-rbac-proxy HTTPs server should listen on.
       --tls-cert-file string                        File containing the default x509 Certificate for HTTPS. (CA cert, if any, concatenated after server cert)
       --tls-cipher-suites strings                   Comma-separated list of cipher suites for the server. Values are from tls package constants (https://golang.org/pkg/crypto/tls/#pkg-constants). If omitted, the default Go cipher suites will be used
+      --tls-curve-preferences int32Slice            Comma-separated set of enabled numeric Go crypto/tls CurveID values for the server. Order is ignored. See https://pkg.go.dev/crypto/tls#CurveID for values supported by the current Go version. If omitted, Go defaults are used (default [])
       --tls-min-version string                      Minimum TLS version supported. Accepts both Go constant names (VersionTLS12, VersionTLS13) and short names (TLS1.2, TLS1.3). (default "VersionTLS12")
       --tls-private-key-file string                 File containing the default x509 private key matching --tls-cert-file.
       --tls-reload-interval duration                [DEPRECATED] The interval at which to watch for TLS certificate changes, by default set to 1 minute. (default 1m0s)

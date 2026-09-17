@@ -68,11 +68,12 @@ type ProxyRunOptions struct {
 }
 
 type TLSConfig struct {
-	CertFile       string
-	KeyFile        string
-	MinVersion     string
-	CipherSuites   []string
-	ReloadInterval time.Duration
+	CertFile         string
+	KeyFile          string
+	MinVersion       string
+	CipherSuites     []string
+	CurvePreferences []int32
+	ReloadInterval   time.Duration
 
 	UpstreamClientCertFile string
 	UpstreamClientKeyFile  string
@@ -116,6 +117,7 @@ func (o *ProxyRunOptions) Flags() k8sapiflag.NamedFlagSets {
 	flagset.StringVar(&o.TLS.KeyFile, "tls-private-key-file", "", "File containing the default x509 private key matching --tls-cert-file.")
 	flagset.StringVar(&o.TLS.MinVersion, "tls-min-version", "VersionTLS12", "Minimum TLS version supported. Accepts both Go constant names (VersionTLS12, VersionTLS13) and short names (TLS1.2, TLS1.3).")
 	flagset.StringSliceVar(&o.TLS.CipherSuites, "tls-cipher-suites", nil, "Comma-separated list of cipher suites for the server. Values are from tls package constants (https://golang.org/pkg/crypto/tls/#pkg-constants). If omitted, the default Go cipher suites will be used")
+	flagset.Int32SliceVar(&o.TLS.CurvePreferences, "tls-curve-preferences", nil, "Comma-separated set of enabled numeric Go crypto/tls CurveID values for the server. Order is ignored. See https://pkg.go.dev/crypto/tls#CurveID for values supported by the current Go version. If omitted, Go defaults are used")
 	flagset.DurationVar(&o.TLS.ReloadInterval, "tls-reload-interval", time.Minute, "[DEPRECATED] The interval at which to watch for TLS certificate changes, by default set to 1 minute.")
 	flagset.StringVar(&o.TLS.UpstreamClientCertFile, "upstream-client-cert-file", "", "If set, the client will be used to authenticate the proxy to upstream. Requires --upstream-client-key-file to be set, too.")
 	flagset.StringVar(&o.TLS.UpstreamClientKeyFile, "upstream-client-key-file", "", "The key matching the certificate from --upstream-client-cert-file. If set, requires --upstream-client-cert-file to be set, too.")
