@@ -381,18 +381,9 @@ func Run(cfg *completedProxyRunOptions) error {
 				})
 			}
 
-			version, err := k8sapiflag.TLSVersion(normalizeTLSVersion(cfg.tls.MinVersion))
-			if err != nil {
-				return fmt.Errorf("TLS version invalid: %w", err)
+			if err := applyTLSConfig(srv.TLSConfig, cfg.tls); err != nil {
+				return err
 			}
-
-			cipherSuiteIDs, err := k8sapiflag.TLSCipherSuites(cfg.tls.CipherSuites)
-			if err != nil {
-				return fmt.Errorf("failed to convert TLS cipher suite name to ID: %w", err)
-			}
-
-			srv.TLSConfig.CipherSuites = cipherSuiteIDs
-			srv.TLSConfig.MinVersion = version
 			srv.TLSConfig.ClientAuth = tls.RequestClientCert
 
 			if err := http2.ConfigureServer(srv, cfg.http2Options); err != nil {
@@ -500,6 +491,28 @@ func Run(cfg *completedProxyRunOptions) error {
 		return fmt.Errorf("failed to run groups: %w", err)
 	}
 
+	return nil
+}
+
+func applyTLSConfig(config *tls.Config, options *options.TLSConfig) error {
+	version, err := k8sapiflag.TLSVersion(normalizeTLSVersion(options.MinVersion))
+	if err != nil {
+		return fmt.Errorf("TLS version invalid: %w", err)
+	}
+
+	cipherSuiteIDs, err := k8sapiflag.TLSCipherSuites(options.CipherSuites)
+	if err != nil {
+		return fmt.Errorf("failed to convert TLS cipher suite name to ID: %w", err)
+	}
+
+	curvePreferences, err := rbac_proxy_tls.ParseCurvePreferences(options.CurvePreferences)
+	if err != nil {
+		return fmt.Errorf("failed to convert TLS curve preferences: %w", err)
+	}
+
+	config.CipherSuites = cipherSuiteIDs
+	config.CurvePreferences = curvePreferences
+	config.MinVersion = version
 	return nil
 }
 
