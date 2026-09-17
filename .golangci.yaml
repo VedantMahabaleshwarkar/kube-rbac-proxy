@@ -7,6 +7,13 @@ linters:
       - common-false-positives
       - legacy
       - std-error-handling
+    rules:
+      # FIXME: golang.org/x/net v0.58.0 deprecated http2/h2c in favour of setting
+      # http.Server.Protocols. Migrating the serving path is out of scope for a
+      # dependency bump; tracked separately.
+      - linters:
+          - staticcheck
+        text: "SA1019:.*h2c"
     paths:
       - test/
       - third_party$
