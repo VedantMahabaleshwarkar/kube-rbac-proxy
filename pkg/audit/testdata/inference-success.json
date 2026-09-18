@@ -1,0 +1,71 @@
+{
+  "activity_id": 99,
+  "activity_name": "Inference",
+  "category_uid": 6,
+  "category_name": "Application Activity",
+  "class_uid": 6003,
+  "class_name": "API Activity",
+  "type_uid": 600399,
+  "severity_id": 1,
+  "severity": "Informational",
+  "time": 1700000000123,
+  "metadata": {
+    "version": "1.9.0",
+    "profiles": ["ai_operation"],
+    "product": {
+      "name": "kube-rbac-proxy",
+      "version": "v0.21.0"
+    },
+    "logged_time": 1700000001623
+  },
+  "actor": {
+    "user": {
+      "name": "system:serviceaccount:models:client",
+      "uid": "uid-123",
+      "type_id": 4,
+      "groups": [
+        {"name": "system:serviceaccounts"},
+        {"name": "models-readers"}
+      ]
+    }
+  },
+  "api": {
+    "operation": "POST /v1/models/fraud:predict"
+  },
+  "http_request": {
+    "http_method": "POST",
+    "version": "2.0",
+    "url": {
+      "path": "/v1/models/fraud:predict"
+    },
+    "x_forwarded_for": ["198.51.100.4", "2001:db8::5"]
+  },
+  "http_response": {
+    "code": 201,
+    "body_length": 27,
+    "latency": 1500
+  },
+  "src_endpoint": {
+    "ip": "2001:db8::5"
+  },
+  "dst_endpoint": {
+    "ip": "2001:db8::20",
+    "port": 9443
+  },
+  "status_id": 1,
+  "status": "Success",
+  "status_code": "201",
+  "resources": [
+    {
+      "name": "fraud-detector",
+      "namespace": "models",
+      "type": "InferenceService",
+      "role_id": 1,
+      "role": "Target"
+    }
+  ],
+  "ai_model": {
+    "name": "fraud-detector",
+    "ai_provider": "KServe"
+  }
+}

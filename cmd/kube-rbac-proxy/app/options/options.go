@@ -25,6 +25,7 @@ import (
 	k8sapiflag "k8s.io/component-base/cli/flag"
 	"k8s.io/klog/v2"
 
+	"github.com/brancz/kube-rbac-proxy/pkg/audit"
 	"github.com/brancz/kube-rbac-proxy/pkg/authn"
 	"github.com/brancz/kube-rbac-proxy/pkg/authz"
 	"github.com/brancz/kube-rbac-proxy/pkg/proxy"
@@ -56,6 +57,13 @@ type ProxyRunOptions struct {
 	QPS   float32
 	Burst int
 
+	AuditLogProfile        audit.Profile
+	AuditResourceName      string
+	AuditResourceNamespace string
+	AuditResourceType      string
+	AuditAIProvider        string
+	AuditUseForwardedFor   bool
+
 	flagSet *pflag.FlagSet
 }
 
@@ -83,7 +91,8 @@ func NewProxyRunOptions() *ProxyRunOptions {
 			},
 			Authorization: &authz.Config{},
 		},
-		TLS: &TLSConfig{},
+		TLS:             &TLSConfig{},
+		AuditLogProfile: audit.ProfileNone,
 	}
 }
 
@@ -95,7 +104,7 @@ func (o *ProxyRunOptions) Flags() k8sapiflag.NamedFlagSets {
 	flagset.StringVar(&o.InsecureListenAddress, "insecure-listen-address", "", "[DEPRECATED] The address the kube-rbac-proxy HTTP server should listen on.")
 	flagset.StringVar(&o.SecureListenAddress, "secure-listen-address", "", "The address the kube-rbac-proxy HTTPs server should listen on.")
 	flagset.StringVar(&o.Upstream, "upstream", "", "The upstream URL to proxy to once requests have successfully been authenticated and authorized.")
-	flagset.DurationVar(&o.UpstreamTimeout, "upstream-timeout", 30*time.Second, "Maximum amount of time the server will wait for a response from the upstream.")
+	flagset.DurationVar(&o.UpstreamTimeout, "upstream-timeout", 30*time.Second, "Maximum amount of time the server will wait for upstream response headers.")
 	flagset.BoolVar(&o.UpstreamForceH2C, "upstream-force-h2c", false, "Force h2c to communicate with the upstream. This is required when the upstream speaks h2c(http/2 cleartext - insecure variant of http/2) only. For example, go-grpc server in the insecure mode, such as helm's tiller w/o TLS, speaks h2c only")
 	flagset.StringVar(&o.UpstreamCAFile, "upstream-ca-file", "", "The CA the upstream uses for TLS connection. This is required when the upstream uses TLS and its own CA certificate")
 	flagset.StringVar(&o.ConfigFileName, "config-file", "", "Configuration file to configure kube-rbac-proxy.")
@@ -139,6 +148,15 @@ func (o *ProxyRunOptions) Flags() k8sapiflag.NamedFlagSets {
 	// HTTP2 flags
 	flagset.Uint32Var(&o.HTTP2MaxConcurrentStreams, "http2-max-concurrent-streams", 100, "The maximum number of concurrent streams per HTTP/2 connection.")
 	flagset.Uint32Var(&o.HTTP2MaxSize, "http2-max-size", 256*1024, "The maximum number of bytes that the server will accept for frame size and buffer per stream in a HTTP/2 request.")
+
+	// Audit flags
+	auditFlagSet := namedFlagSets.FlagSet("audit logging")
+	auditFlagSet.Var(&o.AuditLogProfile, "audit-log-profile", `Audit logging profile. Supported values are "none" (disabled) and "metadata" (request and response metadata without bodies).`)
+	auditFlagSet.StringVar(&o.AuditResourceName, "audit-resource-name", "", "Resource name to include in audit events. Falls back to authorization resourceAttributes.name.")
+	auditFlagSet.StringVar(&o.AuditResourceNamespace, "audit-resource-namespace", "", "Resource namespace to include in audit events. Falls back to authorization resourceAttributes.namespace.")
+	auditFlagSet.StringVar(&o.AuditResourceType, "audit-resource-type", "", "OCSF resource type to include in audit events.")
+	auditFlagSet.StringVar(&o.AuditAIProvider, "audit-ai-provider", "", "AI provider to include in audit events when a resource name is resolved.")
+	auditFlagSet.BoolVar(&o.AuditUseForwardedFor, "audit-use-forwarded-for", false, "Trust X-Forwarded-For for audit source addresses. Enable only when the listener is reached through a trusted router.")
 
 	// disabled flags
 	o.addDisabledFlags(flagset)
@@ -184,6 +202,10 @@ For more information, please go to https://github.com/brancz/kube-rbac-proxy/iss
 
 	if len(o.AllowPaths) > 0 && len(o.IgnorePaths) > 0 {
 		errs = append(errs, fmt.Errorf("cannot use --allow-paths and --ignore-paths together"))
+	}
+
+	if err := o.AuditLogProfile.Validate(); err != nil {
+		errs = append(errs, err)
 	}
 
 	for _, pathAllowed := range o.AllowPaths {

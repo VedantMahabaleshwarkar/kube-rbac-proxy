@@ -22,6 +22,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -41,6 +42,7 @@ import (
 	"golang.org/x/net/http2/h2c"
 
 	"k8s.io/apiserver/pkg/authentication/authenticator"
+	authorizationauthorizer "k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/authorization/union"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -50,10 +52,12 @@ import (
 	"k8s.io/component-base/cli/globalflag"
 	"k8s.io/component-base/logs"
 	"k8s.io/component-base/term"
+	"k8s.io/component-base/version"
 	"k8s.io/component-base/version/verflag"
 	"k8s.io/klog/v2"
 
 	"github.com/brancz/kube-rbac-proxy/cmd/kube-rbac-proxy/app/options"
+	"github.com/brancz/kube-rbac-proxy/pkg/audit"
 	"github.com/brancz/kube-rbac-proxy/pkg/authn"
 	"github.com/brancz/kube-rbac-proxy/pkg/authz"
 	"github.com/brancz/kube-rbac-proxy/pkg/filters"
@@ -61,6 +65,8 @@ import (
 	"github.com/brancz/kube-rbac-proxy/pkg/proxy"
 	rbac_proxy_tls "github.com/brancz/kube-rbac-proxy/pkg/tls"
 )
+
+const auditShutdownTimeout = 5 * time.Second
 
 func NewKubeRBACProxyCommand() *cobra.Command {
 	o := options.NewProxyRunOptions()
@@ -145,6 +151,9 @@ type completedProxyRunOptions struct {
 
 	allowPaths  []string
 	ignorePaths []string
+
+	auditLogProfile audit.Profile
+	auditOptions    audit.Options
 }
 
 func Complete(o *options.ProxyRunOptions) (*completedProxyRunOptions, error) {
@@ -197,6 +206,20 @@ func Complete(o *options.ProxyRunOptions) (*completedProxyRunOptions, error) {
 	}
 
 	completed.auth.Authorization.PrepareEndpoints()
+
+	completed.auditLogProfile = o.AuditLogProfile
+	completed.auditOptions = audit.Options{
+		Resource: audit.ResourceMetadata{
+			Name:      o.AuditResourceName,
+			Namespace: o.AuditResourceNamespace,
+			Type:      o.AuditResourceType,
+		},
+		AuthorizationResource: audit.StaticResourceMetadata(completed.auth.Authorization.ResourceAttributes),
+		AIProvider:            o.AuditAIProvider,
+		UseForwardedFor:       o.AuditUseForwardedFor,
+		UpstreamURL:           completed.upstreamURL,
+		ProductVersion:        version.Get().GitVersion,
+	}
 
 	kubeconfig, err := initKubeConfig(o.KubeconfigLocation)
 	if err != nil {
@@ -286,7 +309,7 @@ func Run(cfg *completedProxyRunOptions) error {
 		// Force http/2 for connections to the upstream i.e. do not start with HTTP1.1 UPGRADE req to
 		// initialize http/2 session.
 		// See https://github.com/golang/go/issues/14141#issuecomment-219212895 for more context
-		proxy.Transport = &http2.Transport{
+		h2cTransport := &http2.Transport{
 			// Allow http schema. This doesn't automatically disable TLS
 			AllowHTTP: true,
 			// Do disable TLS.
@@ -295,47 +318,25 @@ func Run(cfg *completedProxyRunOptions) error {
 				return (&net.Dialer{}).DialContext(ctx, netw, addr)
 			},
 		}
+		proxy.Transport = withResponseHeaderTimeout(h2cTransport, cfg.upstreamTimeout)
 	}
 
-	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		ignorePathFound := false
-		for _, pathIgnored := range cfg.ignorePaths {
-			ignorePathFound, err = path.Match(pathIgnored, req.URL.Path)
-			if err != nil {
-				http.Error(
-					w,
-					http.StatusText(http.StatusInternalServerError),
-					http.StatusInternalServerError,
-				)
-				return
-			}
-			if ignorePathFound {
-				break
-			}
-		}
-
-		// Enforce upstream timeout via request context so it applies for both
-		// http.Transport (ResponseHeaderTimeout) and http2.Transport (e.g. --upstream-force-h2c).
-		proxyReq := req
-		if cfg.upstreamTimeout > 0 {
-			ctx, cancel := context.WithTimeout(req.Context(), cfg.upstreamTimeout)
+	auditLogger, err := newAuditLogger(cfg.auditLogProfile, os.Stdout, cfg.auditOptions)
+	if err != nil {
+		return fmt.Errorf("failed to configure audit logger: %w", err)
+	}
+	if auditLogger != nil {
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), auditShutdownTimeout)
 			defer cancel()
-			proxyReq = req.WithContext(ctx)
-		}
+			if err := auditLogger.Close(ctx); err != nil {
+				klog.Errorf("failed to flush audit log during shutdown: %+v", err)
+			}
+		}()
+	}
+	protectedHandler := buildProtectedHandler(proxy.ServeHTTP, cfg.auth, authenticator, authorizer, auditLogger)
 
-		if !ignorePathFound {
-			handlerFunc := proxy.ServeHTTP
-			handlerFunc = filters.WithAuthHeaders(cfg.auth.Authentication.Header, handlerFunc)
-			handlerFunc = filters.WithAuthorization(authorizer, cfg.auth.Authorization, handlerFunc)
-			handlerFunc = filters.WithAuthentication(authenticator, cfg.auth.Authentication.Token.Audiences, handlerFunc)
-			handlerFunc(w, proxyReq)
-
-			return
-		}
-
-		proxy.ServeHTTP(w, proxyReq)
-	})
-	handler = filters.WithAllowPaths(cfg.allowPaths, handler)
+	handler := buildRequestHandler(proxy.ServeHTTP, protectedHandler, cfg.allowPaths, cfg.ignorePaths)
 
 	mux := http.NewServeMux()
 	mux.Handle("/", handler)
@@ -492,6 +493,70 @@ func Run(cfg *completedProxyRunOptions) error {
 	}
 
 	return nil
+}
+
+func newAuditLogger(profile audit.Profile, output io.Writer, options audit.Options) (*audit.Logger, error) {
+	if err := profile.Validate(); err != nil {
+		return nil, err
+	}
+	switch profile {
+	case audit.ProfileNone:
+		return nil, nil
+	case audit.ProfileMetadata:
+		return audit.NewLogger(output, options), nil
+	default:
+		return nil, fmt.Errorf("audit log profile %q has no logger implementation", profile)
+	}
+}
+
+func buildProtectedHandler(
+	proxyHandler http.HandlerFunc,
+	authConfig *proxy.Config,
+	requestAuthenticator authenticator.Request,
+	requestAuthorizer authorizationauthorizer.Authorizer,
+	auditLogger *audit.Logger,
+) http.HandlerFunc {
+	protectedHandler := filters.WithAuthHeaders(authConfig.Authentication.Header, proxyHandler)
+	if auditLogger == nil {
+		protectedHandler = filters.WithAuthorization(requestAuthorizer, authConfig.Authorization, protectedHandler)
+		return filters.WithAuthentication(requestAuthenticator, authConfig.Authentication.Token.Audiences, protectedHandler)
+	}
+
+	protectedHandler = filters.WithAuthorizationAttributesObserver(
+		requestAuthorizer,
+		authConfig.Authorization,
+		auditLogger.CaptureAuthorizationAttributes,
+		protectedHandler,
+	)
+	protectedHandler = auditLogger.CaptureUser(protectedHandler)
+	protectedHandler = filters.WithAuthentication(requestAuthenticator, authConfig.Authentication.Token.Audiences, protectedHandler)
+	return auditLogger.WithAuditLog(protectedHandler)
+}
+
+func buildRequestHandler(proxyHandler, protectedHandler http.HandlerFunc, allowPaths, ignorePaths []string) http.HandlerFunc {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		ignorePathFound := false
+		for _, pathIgnored := range ignorePaths {
+			var err error
+			ignorePathFound, err = path.Match(pathIgnored, req.URL.Path)
+			if err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			if ignorePathFound {
+				break
+			}
+		}
+
+		if !ignorePathFound {
+			protectedHandler(w, req)
+			return
+		}
+
+		proxyHandler.ServeHTTP(w, req)
+	})
+
+	return filters.WithAllowPaths(allowPaths, handler)
 }
 
 func applyTLSConfig(config *tls.Config, options *options.TLSConfig) error {

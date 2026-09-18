@@ -17,13 +17,98 @@ limitations under the License.
 package app
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 )
+
+var errResponseHeaderTimeout = errors.New("response header timeout")
+
+type responseHeaderTimeoutRoundTripper struct {
+	next      http.RoundTripper
+	timeout   time.Duration
+	afterFunc func(time.Duration, func()) *time.Timer
+}
+
+func withResponseHeaderTimeout(next http.RoundTripper, timeout time.Duration) http.RoundTripper {
+	if timeout <= 0 {
+		return next
+	}
+
+	return &responseHeaderTimeoutRoundTripper{
+		next:    next,
+		timeout: timeout,
+	}
+}
+
+func (r *responseHeaderTimeoutRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx, cancel := context.WithCancelCause(req.Context())
+
+	var mu sync.Mutex
+	completed := false
+	timedOut := false
+	afterFunc := r.afterFunc
+	if afterFunc == nil {
+		afterFunc = time.AfterFunc
+	}
+	timer := afterFunc(r.timeout, func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if completed {
+			return
+		}
+
+		timedOut = true
+		cancel(errResponseHeaderTimeout)
+	})
+	resp, err := r.next.RoundTrip(req.WithContext(ctx))
+
+	mu.Lock()
+	if !timedOut {
+		completed = true
+		timer.Stop()
+	}
+	timeoutWon := timedOut && context.Cause(ctx) == errResponseHeaderTimeout
+	mu.Unlock()
+
+	if timeoutWon {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return nil, fmt.Errorf("upstream response headers: %w", context.DeadlineExceeded)
+	}
+
+	if err != nil || resp == nil || resp.Body == nil {
+		cancel(nil)
+		return resp, err
+	}
+
+	resp.Body = &cancelOnCloseReadCloser{
+		ReadCloser: resp.Body,
+		cancel:     cancel,
+	}
+	return resp, nil
+}
+
+type cancelOnCloseReadCloser struct {
+	io.ReadCloser
+	cancel     context.CancelCauseFunc
+	cancelOnce sync.Once
+}
+
+func (r *cancelOnCloseReadCloser) Close() error {
+	r.cancelOnce.Do(func() {
+		r.cancel(nil)
+	})
+	return r.ReadCloser.Close()
+}
 
 func initTransport(upstreamCAPool *x509.CertPool, upstreamClientCertPath, upstreamClientKeyPath string, timeout time.Duration) (http.RoundTripper, error) {
 	if upstreamCAPool == nil {
