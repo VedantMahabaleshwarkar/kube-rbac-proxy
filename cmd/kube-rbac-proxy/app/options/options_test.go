@@ -54,6 +54,27 @@ func TestValidateRejectsNegativeAuthTimeout(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsNegativeUpstreamTimeout(t *testing.T) {
+	o := NewProxyRunOptions()
+	o.Flags()
+	o.UpstreamTimeout = -time.Second
+
+	err := o.Validate()
+	if err == nil || !strings.Contains(err.Error(), "--upstream-timeout cannot be negative") {
+		t.Fatalf("Validate() error = %v, want negative upstream timeout error", err)
+	}
+}
+
+func TestValidateAllowsZeroUpstreamTimeout(t *testing.T) {
+	o := NewProxyRunOptions()
+	o.Flags()
+	o.UpstreamTimeout = 0
+
+	if err := o.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want zero upstream timeout to remain valid", err)
+	}
+}
+
 func TestAuditFlags(t *testing.T) {
 	o := NewProxyRunOptions()
 	flagSets := o.Flags()

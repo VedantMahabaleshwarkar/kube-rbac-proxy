@@ -217,6 +217,9 @@ For more information, please go to https://github.com/brancz/kube-rbac-proxy/iss
 	if o.AuthTimeout < 0 {
 		errs = append(errs, fmt.Errorf("--auth-timeout cannot be negative"))
 	}
+	if o.UpstreamTimeout < 0 {
+		errs = append(errs, fmt.Errorf("--upstream-timeout cannot be negative"))
+	}
 
 	for _, pathAllowed := range o.AllowPaths {
 		_, err := path.Match(pathAllowed, "")
