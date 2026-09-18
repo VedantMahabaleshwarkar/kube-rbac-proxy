@@ -27,6 +27,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -435,8 +436,9 @@ func TestOversizedAuditEventIsEmittedAsBoundedFallback(t *testing.T) {
 	if truncated, ok := document.Metadata["is_truncated"].(bool); !ok || !truncated {
 		t.Errorf("metadata.is_truncated = %#v, want true", document.Metadata["is_truncated"])
 	}
-	if originalSize, ok := document.Metadata["untruncated_size"].(float64); !ok || int(originalSize) != len(fullPayload) {
-		t.Errorf("metadata.untruncated_size = %#v, want %d", document.Metadata["untruncated_size"], len(fullPayload))
+	wantOriginalSizeKB := (len(fullPayload) + 1023) / 1024
+	if originalSize, ok := document.Metadata["untruncated_size"].(float64); !ok || int(originalSize) != wantOriginalSizeKB {
+		t.Errorf("metadata.untruncated_size = %#v, want %d KB", document.Metadata["untruncated_size"], wantOriginalSizeKB)
 	}
 	if document.Unmapped != nil {
 		t.Errorf("bounded audit unmapped data = %#v, want omitted", document.Unmapped)
@@ -528,6 +530,28 @@ func TestTruncateUTF8KeepsMarkerWithinByteLimit(t *testing.T) {
 			}
 			if roundTrip != got {
 				t.Fatalf("JSON round trip = %q, want %q", roundTrip, got)
+			}
+		})
+	}
+}
+
+func TestBoundedAuditEventReportsOriginalSizeInKilobytes(t *testing.T) {
+	tests := []struct {
+		name          string
+		originalBytes int
+		wantKB        int
+	}{
+		{name: "one byte", originalBytes: 1, wantKB: 1},
+		{name: "one kilobyte", originalBytes: 1024, wantKB: 1},
+		{name: "partial second kilobyte", originalBytes: 1025, wantKB: 2},
+		{name: "large exact size", originalBytes: 128 << 10, wantKB: 128},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := boundedAuditEvent(Event{}, tt.originalBytes).Metadata.UntruncatedSize
+			if got != tt.wantKB {
+				t.Fatalf("untruncated size = %d, want %d KB", got, tt.wantKB)
 			}
 		})
 	}
@@ -642,6 +666,62 @@ func TestAuditWriteFailureDoesNotChangeResponse(t *testing.T) {
 
 	if recorder.Code != http.StatusAccepted || recorder.Body.String() != "accepted" {
 		t.Fatalf("response changed after audit failure: code=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestCapturedUpgradeStatusIsUsedWhenResponseMetricsRemainSynthetic(t *testing.T) {
+	tests := []struct {
+		name           string
+		downstreamCode int
+		wantCode       int
+		wantStatus     string
+	}{
+		{
+			name:       "switching protocols replaces synthetic success",
+			wantCode:   http.StatusSwitchingProtocols,
+			wantStatus: "Success",
+		},
+		{
+			name:           "downstream proxy error remains authoritative",
+			downstreamCode: http.StatusBadGateway,
+			wantCode:       http.StatusBadGateway,
+			wantStatus:     "Failure",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var output bytes.Buffer
+			logger := NewLogger(&output, Options{ProductVersion: "test"})
+			handler := logger.WithAuditLog(func(w http.ResponseWriter, req *http.Request) {
+				if err := logger.CaptureUpstreamResponse(&http.Response{
+					StatusCode: http.StatusSwitchingProtocols,
+					Request:    req,
+				}); err != nil {
+					t.Fatalf("capture upstream response: %v", err)
+				}
+				if tt.downstreamCode != 0 {
+					w.WriteHeader(tt.downstreamCode)
+				}
+			})
+
+			handler(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "http://proxy/upgrade", nil))
+			closeLogger(t, logger)
+
+			var event Event
+			if err := json.NewDecoder(&output).Decode(&event); err != nil {
+				t.Fatalf("decode audit event: %v", err)
+			}
+			if event.HTTPResponse.Code != tt.wantCode || event.StatusCode != strconv.Itoa(tt.wantCode) {
+				t.Errorf("response status = %d/%q, want %d/%q", event.HTTPResponse.Code, event.StatusCode, tt.wantCode, strconv.Itoa(tt.wantCode))
+			}
+			if event.Status != tt.wantStatus {
+				t.Errorf("OCSF status = %q, want %q", event.Status, tt.wantStatus)
+			}
+			if event.HTTPResponse.BodyLength != 0 {
+				t.Errorf("upgrade body length = %d, want 0", event.HTTPResponse.BodyLength)
+			}
+		})
 	}
 }
 
@@ -986,6 +1066,88 @@ func TestLoggerCloseDeadlineCanBeRetried(t *testing.T) {
 	closeLogger(t, logger)
 }
 
+func TestSinkWriteLossIsReportedBeforeNextEventAndAtShutdown(t *testing.T) {
+	newHandler := func(logger *Logger) http.HandlerFunc {
+		return logger.WithAuditLog(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		})
+	}
+	request := func(handler http.HandlerFunc, path string) {
+		req := httptest.NewRequest(http.MethodPost, "http://proxy"+path, nil)
+		req.RemoteAddr = "192.0.2.7:8080"
+		handler(httptest.NewRecorder(), req)
+	}
+
+	t.Run("before next event", func(t *testing.T) {
+		writer := newControlledWriter()
+		logger := newLogger(writer, Options{ProductVersion: "test"}, 2)
+		t.Cleanup(func() {
+			writer.stop()
+			closeLogger(t, logger)
+		})
+		handler := newHandler(logger)
+
+		request(handler, "/failed")
+		failedAttempt := nextAuditWrite(t, writer)
+		if got := decodeAuditWrite(t, failedAttempt).HTTPRequest.URL.Path; got != "/failed" {
+			t.Fatalf("failed audit path = %q, want /failed", got)
+		}
+		failedAttempt.finish(errors.New("event sink failure"))
+
+		request(handler, "/next")
+		gapAttempt := nextAuditWrite(t, writer)
+		gap := decodeAuditWrite(t, gapAttempt)
+		if gap.ClassUID != 0 || gap.ActivityName != "Audit Event Loss" || gap.Count != 1 {
+			t.Fatalf("gap = class %d activity %q count %d, want Base Event loss count 1", gap.ClassUID, gap.ActivityName, gap.Count)
+		}
+		gapAttempt.finish(nil)
+
+		nextAttempt := nextAuditWrite(t, writer)
+		if got := decodeAuditWrite(t, nextAttempt).HTTPRequest.URL.Path; got != "/next" {
+			t.Fatalf("audit path after gap = %q, want /next", got)
+		}
+		nextAttempt.finish(nil)
+		closeLogger(t, logger)
+
+		if got := logger.dropped.Load(); got != 1 {
+			t.Fatalf("dropped events = %d, want 1", got)
+		}
+	})
+
+	t.Run("at shutdown", func(t *testing.T) {
+		writer := newControlledWriter()
+		logger := newLogger(writer, Options{ProductVersion: "test"}, 1)
+		t.Cleanup(func() {
+			writer.stop()
+			closeLogger(t, logger)
+		})
+		handler := newHandler(logger)
+
+		request(handler, "/failed")
+		failedAttempt := nextAuditWrite(t, writer)
+		failedAttempt.finish(errors.New("event sink failure"))
+
+		closeResult := make(chan error, 1)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			closeResult <- logger.Close(ctx)
+		}()
+		gapAttempt := nextAuditWrite(t, writer)
+		gap := decodeAuditWrite(t, gapAttempt)
+		if gap.ClassUID != 0 || gap.ActivityName != "Audit Event Loss" || gap.Count != 1 {
+			t.Fatalf("shutdown gap = class %d activity %q count %d, want Base Event loss count 1", gap.ClassUID, gap.ActivityName, gap.Count)
+		}
+		gapAttempt.finish(nil)
+		if err := <-closeResult; err != nil {
+			t.Fatalf("Close() error = %v, want nil", err)
+		}
+		if got := logger.dropped.Load(); got != 1 {
+			t.Fatalf("dropped events = %d, want 1", got)
+		}
+	})
+}
+
 func TestQueueLossIsAggregatedBetweenNormalEventsWithoutBlockingRequests(t *testing.T) {
 	writer := newControlledWriter()
 	logger := newLogger(writer, Options{ProductVersion: "test"}, 1)
@@ -1267,5 +1429,71 @@ func TestResourceMetadataPrecedenceAndOptionalFields(t *testing.T) {
 	event = logger.event(request, &requestContext{}, httpsnoop.Metrics{Code: http.StatusOK}, time.Unix(1, 0))
 	if len(event.Resources) != 0 || event.AIModel != nil {
 		t.Errorf("unresolved resource name must omit resources and AI model: %+v", event)
+	}
+}
+
+func TestMatchedAuthorizationEndpointSuppressesStaticFallback(t *testing.T) {
+	config := &authz.Config{Endpoints: []authz.Endpoint{{Path: "/v1/models/{model}/predict"}}}
+	config.PrepareEndpoints()
+
+	tests := []struct {
+		name     string
+		path     string
+		explicit ResourceMetadata
+		want     []Resource
+	}{
+		{
+			name: "matched endpoint without resolved attributes",
+			path: "/v1/models/fraud-detector/predict",
+		},
+		{
+			name:     "matched endpoint preserves explicit audit metadata",
+			path:     "/v1/models/fraud-detector/predict",
+			explicit: ResourceMetadata{Name: "explicit-model", Namespace: "models", Type: "InferenceService"},
+			want: []Resource{{
+				Name:      "explicit-model",
+				Namespace: "models",
+				Type:      "InferenceService",
+				RoleID:    resourceRoleTargetID,
+				Role:      resourceRoleTargetName,
+			}},
+		},
+		{
+			name: "nonmatching endpoint retains Format1 fallback",
+			path: "/healthz",
+			want: []Resource{{
+				Name:      "format1-model",
+				Namespace: "format1-namespace",
+				RoleID:    resourceRoleTargetID,
+				Role:      resourceRoleTargetName,
+			}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var output bytes.Buffer
+			logger := NewLogger(&output, Options{
+				Resource:              tt.explicit,
+				AuthorizationResource: ResourceMetadata{Name: "format1-model", Namespace: "format1-namespace"},
+				ProductVersion:        "test",
+			})
+			handler := logger.CaptureAuthorizationEndpointMatch(config, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+			})
+			handler = logger.WithAuditLog(handler)
+
+			req := httptest.NewRequest(http.MethodPost, "http://proxy"+tt.path, nil)
+			handler(httptest.NewRecorder(), req)
+			closeLogger(t, logger)
+
+			var event Event
+			if err := json.NewDecoder(&output).Decode(&event); err != nil {
+				t.Fatalf("decode audit event: %v", err)
+			}
+			if diff := cmp.Diff(tt.want, event.Resources); diff != "" {
+				t.Errorf("resources mismatch (-want +got):\n%s", diff)
+			}
+		})
 	}
 }

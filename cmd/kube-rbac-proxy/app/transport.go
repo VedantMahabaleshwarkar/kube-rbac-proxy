@@ -29,60 +29,77 @@ import (
 	"time"
 )
 
-var errResponseHeaderTimeout = errors.New("response header timeout")
+var errUpstreamTimeout = errors.New("upstream timeout")
 
-type responseHeaderTimeoutRoundTripper struct {
+type upstreamTimeoutRoundTripper struct {
 	next      http.RoundTripper
 	timeout   time.Duration
+	now       func() time.Time
 	afterFunc func(time.Duration, func()) *time.Timer
 }
 
-func withResponseHeaderTimeout(next http.RoundTripper, timeout time.Duration) http.RoundTripper {
+func withUpstreamTimeout(next http.RoundTripper, timeout time.Duration) http.RoundTripper {
 	if timeout <= 0 {
 		return next
 	}
 
-	return &responseHeaderTimeoutRoundTripper{
+	return &upstreamTimeoutRoundTripper{
 		next:    next,
 		timeout: timeout,
 	}
 }
 
-func (r *responseHeaderTimeoutRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+func (r *upstreamTimeoutRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	now := r.now
+	if now == nil {
+		now = time.Now
+	}
+	timeout := r.timeout
+	if budget, ok := req.Context().Value(requestTimeoutBudgetContextKey{}).(requestTimeoutBudget); ok && !budget.upstreamDeadline.IsZero() {
+		timeout = budget.upstreamDeadline.Sub(now())
+	}
+	if timeout <= 0 {
+		if cause := context.Cause(req.Context()); cause != nil {
+			return nil, cause
+		}
+		return nil, fmt.Errorf("upstream request before response headers: %w", context.DeadlineExceeded)
+	}
+
 	ctx, cancel := context.WithCancelCause(req.Context())
 
 	var mu sync.Mutex
 	completed := false
 	timedOut := false
+	var timer *time.Timer
 	afterFunc := r.afterFunc
 	if afterFunc == nil {
 		afterFunc = time.AfterFunc
 	}
-	timer := afterFunc(r.timeout, func() {
+	timer = afterFunc(timeout, func() {
 		mu.Lock()
-		defer mu.Unlock()
 		if completed {
+			mu.Unlock()
 			return
 		}
-
 		timedOut = true
-		cancel(errResponseHeaderTimeout)
+		cancel(errUpstreamTimeout)
+		mu.Unlock()
 	})
 	resp, err := r.next.RoundTrip(req.WithContext(ctx))
 
 	mu.Lock()
-	if !timedOut {
-		completed = true
+	completed = true
+	if timer != nil {
 		timer.Stop()
 	}
-	timeoutWon := timedOut && context.Cause(ctx) == errResponseHeaderTimeout
+	timeoutWon := timedOut && context.Cause(ctx) == errUpstreamTimeout
 	mu.Unlock()
 
 	if timeoutWon {
 		if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
 		}
-		return nil, fmt.Errorf("upstream response headers: %w", context.DeadlineExceeded)
+		return nil, fmt.Errorf("upstream request before response headers: %w", context.DeadlineExceeded)
 	}
 
 	if err != nil || resp == nil || resp.Body == nil {
@@ -90,9 +107,16 @@ func (r *responseHeaderTimeoutRoundTripper) RoundTrip(req *http.Request) (*http.
 		return resp, err
 	}
 
-	resp.Body = &cancelOnCloseReadCloser{
-		ReadCloser: resp.Body,
-		cancel:     cancel,
+	if readWriteBody, ok := resp.Body.(io.ReadWriteCloser); ok {
+		resp.Body = &cancelOnCloseReadWriteCloser{
+			ReadWriteCloser: readWriteBody,
+			cancel:          cancel,
+		}
+	} else {
+		resp.Body = &cancelOnCloseReadCloser{
+			ReadCloser: resp.Body,
+			cancel:     cancel,
+		}
 	}
 	return resp, nil
 }
@@ -108,6 +132,19 @@ func (r *cancelOnCloseReadCloser) Close() error {
 		r.cancel(nil)
 	})
 	return r.ReadCloser.Close()
+}
+
+type cancelOnCloseReadWriteCloser struct {
+	io.ReadWriteCloser
+	cancel     context.CancelCauseFunc
+	cancelOnce sync.Once
+}
+
+func (r *cancelOnCloseReadWriteCloser) Close() error {
+	r.cancelOnce.Do(func() {
+		r.cancel(nil)
+	})
+	return r.ReadWriteCloser.Close()
 }
 
 func initTransport(upstreamCAPool *x509.CertPool, upstreamClientCertPath, upstreamClientKeyPath string, timeout time.Duration) (http.RoundTripper, error) {

@@ -144,8 +144,9 @@ type completedProxyRunOptions struct {
 
 	http2Options *http2.Server
 
-	auth *proxy.Config
-	tls  *options.TLSConfig
+	auth        *proxy.Config
+	authTimeout time.Duration
+	tls         *options.TLSConfig
 
 	kubeClient *kubernetes.Clientset
 
@@ -188,6 +189,7 @@ func Complete(o *options.ProxyRunOptions) (*completedProxyRunOptions, error) {
 	}
 
 	completed.auth = o.Auth
+	completed.authTimeout = o.AuthTimeout
 	completed.tls = o.TLS
 
 	if completed.auth == nil {
@@ -318,13 +320,15 @@ func Run(cfg *completedProxyRunOptions) error {
 				return (&net.Dialer{}).DialContext(ctx, netw, addr)
 			},
 		}
-		proxy.Transport = withResponseHeaderTimeout(h2cTransport, cfg.upstreamTimeout)
+		proxy.Transport = h2cTransport
 	}
+	proxy.Transport = withUpstreamTimeout(proxy.Transport, cfg.upstreamTimeout)
 
 	auditLogger, err := newAuditLogger(cfg.auditLogProfile, os.Stdout, cfg.auditOptions)
 	if err != nil {
 		return fmt.Errorf("failed to configure audit logger: %w", err)
 	}
+	configureAuditResponseCapture(proxy, auditLogger)
 	if auditLogger != nil {
 		defer func() {
 			ctx, cancel := context.WithTimeout(context.Background(), auditShutdownTimeout)
@@ -334,9 +338,10 @@ func Run(cfg *completedProxyRunOptions) error {
 			}
 		}()
 	}
-	protectedHandler := buildProtectedHandler(proxy.ServeHTTP, cfg.auth, authenticator, authorizer, auditLogger)
+	protectedHandler := buildProtectedHandler(proxy.ServeHTTP, cfg.auth, authenticator, authorizer, cfg.authTimeout, auditLogger)
 
 	handler := buildRequestHandler(proxy.ServeHTTP, protectedHandler, cfg.allowPaths, cfg.ignorePaths)
+	handler = withRequestTimeouts(handler, cfg.upstreamTimeout, cfg.authTimeout)
 
 	mux := http.NewServeMux()
 	mux.Handle("/", handler)
@@ -509,17 +514,39 @@ func newAuditLogger(profile audit.Profile, output io.Writer, options audit.Optio
 	}
 }
 
+func configureAuditResponseCapture(reverseProxy *httputil.ReverseProxy, auditLogger *audit.Logger) {
+	if auditLogger == nil {
+		return
+	}
+
+	next := reverseProxy.ModifyResponse
+	reverseProxy.ModifyResponse = func(response *http.Response) error {
+		if err := auditLogger.CaptureUpstreamResponse(response); err != nil {
+			return err
+		}
+		if next != nil {
+			return next(response)
+		}
+		return nil
+	}
+}
+
 func buildProtectedHandler(
 	proxyHandler http.HandlerFunc,
 	authConfig *proxy.Config,
 	requestAuthenticator authenticator.Request,
 	requestAuthorizer authorizationauthorizer.Authorizer,
+	authTimeout time.Duration,
 	auditLogger *audit.Logger,
 ) http.HandlerFunc {
+	requestAuthenticator = withAuthenticationTimeout(requestAuthenticator, authTimeout)
+	requestAuthorizer = withAuthorizationTimeout(requestAuthorizer, authTimeout)
+
 	protectedHandler := filters.WithAuthHeaders(authConfig.Authentication.Header, proxyHandler)
 	if auditLogger == nil {
 		protectedHandler = filters.WithAuthorization(requestAuthorizer, authConfig.Authorization, protectedHandler)
-		return filters.WithAuthentication(requestAuthenticator, authConfig.Authentication.Token.Audiences, protectedHandler)
+		protectedHandler = filters.WithAuthentication(requestAuthenticator, authConfig.Authentication.Token.Audiences, protectedHandler)
+		return withSharedAuthTimeout(protectedHandler, authTimeout)
 	}
 
 	protectedHandler = filters.WithAuthorizationAttributesObserver(
@@ -530,7 +557,9 @@ func buildProtectedHandler(
 	)
 	protectedHandler = auditLogger.CaptureUser(protectedHandler)
 	protectedHandler = filters.WithAuthentication(requestAuthenticator, authConfig.Authentication.Token.Audiences, protectedHandler)
-	return auditLogger.WithAuditLog(protectedHandler)
+	protectedHandler = auditLogger.CaptureAuthorizationEndpointMatch(authConfig.Authorization, protectedHandler)
+	protectedHandler = auditLogger.WithAuditLog(protectedHandler)
+	return withSharedAuthTimeout(protectedHandler, authTimeout)
 }
 
 func buildRequestHandler(proxyHandler, protectedHandler http.HandlerFunc, allowPaths, ignorePaths []string) http.HandlerFunc {

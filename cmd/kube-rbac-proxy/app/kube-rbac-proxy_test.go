@@ -23,6 +23,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -152,6 +153,7 @@ func TestCompleteBuildsAuditOptions(t *testing.T) {
 			o.AuditResourceType = "InferenceService"
 			o.AuditAIProvider = "KServe"
 			o.AuditUseForwardedFor = true
+			o.AuthTimeout = 17 * time.Second
 			tt.authorizationResource.Resource = "inferenceservices"
 			o.Auth.Authorization.ResourceAttributes = &tt.authorizationResource
 
@@ -164,6 +166,9 @@ func TestCompleteBuildsAuditOptions(t *testing.T) {
 			}
 			if completed.kubeClient == nil {
 				t.Fatal("kubeClient = nil, want client constructed without a live request")
+			}
+			if completed.authTimeout != 17*time.Second {
+				t.Fatalf("authTimeout = %v, want 17s", completed.authTimeout)
 			}
 
 			want := audit.Options{
@@ -182,6 +187,17 @@ func TestCompleteBuildsAuditOptions(t *testing.T) {
 				t.Errorf("audit options mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+func TestCommandExposesAuthTimeout(t *testing.T) {
+	cmd := NewKubeRBACProxyCommand()
+	flag := cmd.Flags().Lookup("auth-timeout")
+	if flag == nil {
+		t.Fatal("flag --auth-timeout is not registered on the command")
+	}
+	if flag.DefValue != "30s" {
+		t.Fatalf("--auth-timeout default = %q, want 30s", flag.DefValue)
 	}
 }
 
@@ -236,6 +252,38 @@ func TestNewAuditLoggerSelectsImplementedProfile(t *testing.T) {
 				closeAuditLogger(t, logger)
 			}
 		})
+	}
+}
+
+func TestConfigureAuditResponseCapture(t *testing.T) {
+	var output bytes.Buffer
+	logger := audit.NewLogger(&output, audit.Options{ProductVersion: "test"})
+	previousCalled := false
+	reverseProxy := &httputil.ReverseProxy{
+		ModifyResponse: func(*http.Response) error {
+			previousCalled = true
+			return nil
+		},
+	}
+	configureAuditResponseCapture(reverseProxy, logger)
+	handler := logger.WithAuditLog(func(_ http.ResponseWriter, req *http.Request) {
+		if err := reverseProxy.ModifyResponse(&http.Response{
+			StatusCode: http.StatusSwitchingProtocols,
+			Request:    req,
+		}); err != nil {
+			t.Fatalf("ModifyResponse() error: %v", err)
+		}
+	})
+
+	handler(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/upgrade", nil))
+	closeAuditLogger(t, logger)
+
+	if !previousCalled {
+		t.Fatal("existing ModifyResponse hook was not called")
+	}
+	events := decodeAuditEvents(t, &output)
+	if len(events) != 1 || events[0].HTTPResponse.Code != http.StatusSwitchingProtocols {
+		t.Fatalf("captured events = %+v, want one event with status 101", events)
 	}
 }
 
@@ -655,7 +703,7 @@ func TestBuildProtectedHandlerAuditsFullChain(t *testing.T) {
 				upstreamCalled = true
 				w.WriteHeader(http.StatusOK)
 			})
-			protected := buildProtectedHandler(upstream, authConfig, requestAuthenticator, requestAuthorizer, auditLogger)
+			protected := buildProtectedHandler(upstream, authConfig, requestAuthenticator, requestAuthorizer, 0, auditLogger)
 			handler := buildRequestHandler(upstream, protected, nil, nil)
 
 			recorder := httptest.NewRecorder()
@@ -705,6 +753,285 @@ func TestBuildProtectedHandlerAuditsFullChain(t *testing.T) {
 			}
 			if diff := cmp.Diff(wantResources, event.Resources); diff != "" {
 				t.Errorf("audit resources mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestBuildProtectedHandlerEnforcesAuthTimeoutWithoutConstrainingUpstream(t *testing.T) {
+	const timeout = 10 * time.Millisecond
+	authConfig := &proxy.Config{
+		Authentication: &authn.AuthnConfig{
+			Header: &authn.AuthnHeaderConfig{},
+			Token:  &authn.TokenConfig{},
+		},
+		Authorization: &authz.Config{ResourceAttributes: &authz.ResourceAttributes{
+			Resource: "inferenceservices",
+			Verb:     "create",
+			Name:     "model",
+		}},
+	}
+	authenticated := authenticator.RequestFunc(func(*http.Request) (*authenticator.Response, bool, error) {
+		return &authenticator.Response{User: &user.DefaultInfo{Name: "alice"}}, true, nil
+	})
+	allowed := authorizer.AuthorizerFunc(func(context.Context, authorizer.Attributes) (authorizer.Decision, string, error) {
+		return authorizer.DecisionAllow, "", nil
+	})
+
+	t.Run("authentication and authorization share one deadline", func(t *testing.T) {
+		var authenticationDeadline time.Time
+		sharedDeadlineAuthenticator := authenticator.RequestFunc(func(req *http.Request) (*authenticator.Response, bool, error) {
+			var ok bool
+			authenticationDeadline, ok = req.Context().Deadline()
+			if !ok {
+				t.Fatal("authentication context has no deadline")
+			}
+			time.Sleep(timeout)
+			return &authenticator.Response{User: &user.DefaultInfo{Name: "alice"}}, true, nil
+		})
+		var authorizationDeadline time.Time
+		sharedDeadlineAuthorizer := authorizer.AuthorizerFunc(func(ctx context.Context, _ authorizer.Attributes) (authorizer.Decision, string, error) {
+			var ok bool
+			authorizationDeadline, ok = ctx.Deadline()
+			if !ok {
+				t.Fatal("authorization context has no deadline")
+			}
+			return authorizer.DecisionAllow, "", nil
+		})
+		upstream := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			if _, ok := req.Context().Deadline(); ok {
+				t.Error("auth deadline leaked into upstream request context")
+			}
+			w.WriteHeader(http.StatusNoContent)
+		})
+		handler := buildProtectedHandler(upstream, authConfig, sharedDeadlineAuthenticator, sharedDeadlineAuthorizer, time.Second, nil)
+
+		recorder := httptest.NewRecorder()
+		handler(recorder, httptest.NewRequest(http.MethodPost, "/infer", nil))
+		if recorder.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNoContent)
+		}
+		if !authenticationDeadline.Equal(authorizationDeadline) {
+			t.Fatalf("authentication deadline = %v, authorization deadline = %v; want one shared deadline", authenticationDeadline, authorizationDeadline)
+		}
+	})
+
+	t.Run("authentication timeout remains unauthorized", func(t *testing.T) {
+		timedOutAuthenticator := authenticator.RequestFunc(func(req *http.Request) (*authenticator.Response, bool, error) {
+			<-req.Context().Done()
+			return nil, false, context.Cause(req.Context())
+		})
+		upstream := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			t.Fatal("upstream called after authentication timeout")
+		})
+		handler := buildProtectedHandler(upstream, authConfig, timedOutAuthenticator, allowed, timeout, nil)
+
+		recorder := httptest.NewRecorder()
+		handler(recorder, httptest.NewRequest(http.MethodPost, "/infer", nil))
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUnauthorized)
+		}
+	})
+
+	t.Run("authorization timeout remains an internal error", func(t *testing.T) {
+		timedOutAuthorizer := authorizer.AuthorizerFunc(func(ctx context.Context, _ authorizer.Attributes) (authorizer.Decision, string, error) {
+			<-ctx.Done()
+			return authorizer.DecisionNoOpinion, "", context.Cause(ctx)
+		})
+		upstream := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			t.Fatal("upstream called after authorization timeout")
+		})
+		handler := buildProtectedHandler(upstream, authConfig, authenticated, timedOutAuthorizer, timeout, nil)
+
+		recorder := httptest.NewRecorder()
+		handler(recorder, httptest.NewRequest(http.MethodPost, "/infer", nil))
+		if recorder.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want %d", recorder.Code, http.StatusInternalServerError)
+		}
+	})
+
+	t.Run("upstream request keeps its original lifetime", func(t *testing.T) {
+		upstream := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			if _, ok := req.Context().Deadline(); ok {
+				t.Error("auth timeout leaked into upstream request context")
+			}
+			time.Sleep(3 * timeout)
+			w.WriteHeader(http.StatusNoContent)
+		})
+		handler := buildProtectedHandler(upstream, authConfig, authenticated, allowed, timeout, nil)
+
+		recorder := httptest.NewRecorder()
+		handler(recorder, httptest.NewRequest(http.MethodPost, "/infer", nil))
+		if recorder.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNoContent)
+		}
+	})
+}
+
+func TestOverallTimeoutCapsAuthenticationBeforeUpstream(t *testing.T) {
+	const (
+		upstreamTimeout = 10 * time.Millisecond
+		authTimeout     = time.Second
+	)
+	authConfig := &proxy.Config{
+		Authentication: &authn.AuthnConfig{
+			Header: &authn.AuthnHeaderConfig{},
+			Token:  &authn.TokenConfig{},
+		},
+		Authorization: &authz.Config{ResourceAttributes: &authz.ResourceAttributes{
+			Resource: "inferenceservices",
+			Verb:     "create",
+		}},
+	}
+	var authenticationDeadline time.Time
+	timedOutAuthenticator := authenticator.RequestFunc(func(req *http.Request) (*authenticator.Response, bool, error) {
+		var ok bool
+		authenticationDeadline, ok = req.Context().Deadline()
+		if !ok {
+			t.Fatal("authentication context has no overall deadline")
+		}
+		<-req.Context().Done()
+		return nil, false, context.Cause(req.Context())
+	})
+	requestAuthorizer := authorizer.AuthorizerFunc(func(context.Context, authorizer.Attributes) (authorizer.Decision, string, error) {
+		t.Fatal("authorization called after the overall deadline expired during authentication")
+		return authorizer.DecisionNoOpinion, "", nil
+	})
+	upstream := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("upstream called after the overall deadline expired during authentication")
+	})
+	protected := buildProtectedHandler(upstream, authConfig, timedOutAuthenticator, requestAuthorizer, authTimeout, nil)
+	handler := withRequestTimeouts(buildRequestHandler(upstream, protected, nil, nil), upstreamTimeout, authTimeout)
+
+	started := time.Now()
+	recorder := httptest.NewRecorder()
+	handler(recorder, httptest.NewRequest(http.MethodPost, "/infer", nil))
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUnauthorized)
+	}
+	if latestExpectedDeadline := started.Add(10 * upstreamTimeout); authenticationDeadline.After(latestExpectedDeadline) {
+		t.Fatalf("authentication deadline = %v, want overall deadline near %v rather than a reset auth deadline", authenticationDeadline, started.Add(upstreamTimeout))
+	}
+}
+
+func TestBuildProtectedHandlerAuditsFormat2Ownership(t *testing.T) {
+	authConfig := &proxy.Config{
+		Authentication: &authn.AuthnConfig{
+			Header: &authn.AuthnHeaderConfig{},
+			Token:  &authn.TokenConfig{},
+		},
+		Authorization: &authz.Config{
+			ResourceAttributes: &authz.ResourceAttributes{
+				Resource:  "inferenceservices",
+				Verb:      "get",
+				Name:      "format1-model",
+				Namespace: "format1-namespace",
+			},
+			Endpoints: []authz.Endpoint{{
+				Path: "/v1/models/{model}/predict",
+				Mappings: []authz.EndpointMapping{{
+					Methods: []string{http.MethodPost},
+					Resources: []authz.EndpointResourceRule{{
+						Rewrites: authz.SubjectAccessReviewRewrites{
+							ByHTTPHeader: &authz.HTTPHeaderRewriteConfig{Name: "X-Model-Name"},
+						},
+						ResourceAttributes: authz.ResourceAttributes{
+							Resource:  "inferenceservices",
+							Name:      "{{ .FromHeader }}",
+							Namespace: "models",
+						},
+					}},
+				}},
+			}},
+		},
+	}
+	authConfig.Authorization.PrepareEndpoints()
+
+	tests := []struct {
+		name         string
+		method       string
+		path         string
+		modelHeader  string
+		wantStatus   int
+		wantResource []audit.Resource
+	}{
+		{
+			name:       "matched endpoint with missing header",
+			method:     http.MethodPost,
+			path:       "/v1/models/fraud-detector/predict",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "matched endpoint with disallowed method",
+			method:     http.MethodGet,
+			path:       "/v1/models/fraud-detector/predict",
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:        "matched endpoint with resolved attributes",
+			method:      http.MethodPost,
+			path:        "/v1/models/fraud-detector/predict",
+			modelHeader: "request-model",
+			wantStatus:  http.StatusNoContent,
+			wantResource: []audit.Resource{{
+				Name:      "request-model",
+				Namespace: "models",
+				Type:      "InferenceService",
+				RoleID:    1,
+				Role:      "Target",
+			}},
+		},
+		{
+			name:       "nonmatching endpoint uses Format1",
+			method:     http.MethodGet,
+			path:       "/healthz",
+			wantStatus: http.StatusNoContent,
+			wantResource: []audit.Resource{{
+				Name:      "format1-model",
+				Namespace: "format1-namespace",
+				Type:      "InferenceService",
+				RoleID:    1,
+				Role:      "Target",
+			}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var output bytes.Buffer
+			logger := audit.NewLogger(&output, audit.Options{
+				Resource:              audit.ResourceMetadata{Type: "InferenceService"},
+				AuthorizationResource: audit.ResourceMetadata{Name: "format1-model", Namespace: "format1-namespace"},
+				ProductVersion:        "test",
+			})
+			requestAuthenticator := authenticator.RequestFunc(func(*http.Request) (*authenticator.Response, bool, error) {
+				return &authenticator.Response{User: &user.DefaultInfo{Name: "alice"}}, true, nil
+			})
+			requestAuthorizer := authorizer.AuthorizerFunc(func(context.Context, authorizer.Attributes) (authorizer.Decision, string, error) {
+				return authorizer.DecisionAllow, "", nil
+			})
+			upstream := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			})
+			handler := buildProtectedHandler(upstream, authConfig, requestAuthenticator, requestAuthorizer, 0, logger)
+
+			recorder := httptest.NewRecorder()
+			req := httptest.NewRequest(tt.method, tt.path, nil)
+			if tt.modelHeader != "" {
+				req.Header.Set("X-Model-Name", tt.modelHeader)
+			}
+			handler(recorder, req)
+			closeAuditLogger(t, logger)
+
+			if recorder.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", recorder.Code, tt.wantStatus)
+			}
+			events := decodeAuditEvents(t, &output)
+			if len(events) != 1 {
+				t.Fatalf("audit events = %d, want 1", len(events))
+			}
+			if diff := cmp.Diff(tt.wantResource, events[0].Resources); diff != "" {
+				t.Errorf("resources mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}

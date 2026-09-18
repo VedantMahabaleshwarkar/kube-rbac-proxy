@@ -77,8 +77,10 @@ func containsTemplateDelimiter(value string) bool {
 type contextKey struct{}
 
 type requestContext struct {
-	user     user.Info
-	resource ResourceMetadata
+	user                         user.Info
+	resource                     ResourceMetadata
+	authorizationEndpointMatched bool
+	upstreamStatusCode           int
 }
 
 const (
@@ -91,7 +93,8 @@ const (
 
 // Logger queues OCSF events for a single writer goroutine. The bounded queue
 // prevents a slow audit sink from stalling request handlers. Events are
-// best-effort; queue overflow is accumulated for direct writer reporting.
+// best-effort; queue overflow and failed record writes are accumulated for
+// direct writer reporting.
 type Logger struct {
 	writer      io.Writer
 	options     Options
@@ -146,6 +149,7 @@ func (l *Logger) run() {
 		}
 		event.Metadata.LoggedTime = time.Now().UnixMilli()
 		if err := l.encode(event); err != nil {
+			l.recordLoss(time.Now().UnixMilli())
 			l.report("failed to write audit event", err)
 		}
 	}
@@ -260,6 +264,26 @@ func (l *Logger) CaptureUser(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// CaptureAuthorizationEndpointMatch records that a Format2 endpoint owns the
+// request before authorization attribute resolution can fail.
+func (l *Logger) CaptureAuthorizationEndpointMatch(config *authz.Config, next http.HandlerFunc) http.HandlerFunc {
+	if config == nil || len(config.Endpoints) == 0 {
+		return next
+	}
+
+	return func(w http.ResponseWriter, req *http.Request) {
+		if data, ok := req.Context().Value(contextKey{}).(*requestContext); ok {
+			for _, endpoint := range config.Endpoints {
+				if authz.MatchEndpoint(req.URL.Path, endpoint) {
+					data.authorizationEndpointMatched = true
+					break
+				}
+			}
+		}
+		next.ServeHTTP(w, req)
+	}
+}
+
 // CaptureAuthorizationAttributes records the effective, request-specific
 // resource attributes produced by the authorization filter.
 func (l *Logger) CaptureAuthorizationAttributes(req *http.Request, attrs []authorizer.Attributes) {
@@ -273,6 +297,18 @@ func (l *Logger) CaptureAuthorizationAttributes(req *http.Request, attrs []autho
 			return
 		}
 	}
+}
+
+// CaptureUpstreamResponse records the upstream status before ReverseProxy
+// handles protocol upgrades and bypasses the wrapped response writer.
+func (l *Logger) CaptureUpstreamResponse(response *http.Response) error {
+	if response == nil || response.Request == nil {
+		return nil
+	}
+	if data, ok := response.Request.Context().Value(contextKey{}).(*requestContext); ok {
+		data.upstreamStatusCode = response.StatusCode
+	}
+	return nil
 }
 
 // WithAuditLog captures final response metrics without buffering request or
@@ -387,7 +423,7 @@ func boundedAuditEvent(event Event, originalSize int) Event {
 			Version:         truncateUTF8(event.Metadata.Version, maxAuditDynamicStringSize),
 			Profiles:        []string{aiOperationProfile},
 			IsTruncated:     true,
-			UntruncatedSize: originalSize,
+			UntruncatedSize: (originalSize + 1023) / 1024,
 			Product: Product{
 				Name:    truncateUTF8(event.Metadata.Product.Name, maxAuditDynamicStringSize),
 				Version: truncateUTF8(event.Metadata.Product.Version, maxAuditDynamicStringSize),
@@ -463,6 +499,11 @@ func truncateUTF8(value string, limit int) string {
 }
 
 func (l *Logger) recordQueueLoss(timestamp int64) {
+	l.recordLoss(timestamp)
+	l.report("audit event queue is full; dropping event", nil)
+}
+
+func (l *Logger) recordLoss(timestamp int64) {
 	l.lossMu.Lock()
 	if l.pendingLoss.Count == 0 {
 		l.pendingLoss.StartTime = timestamp
@@ -472,7 +513,6 @@ func (l *Logger) recordQueueLoss(timestamp int64) {
 	l.lossMu.Unlock()
 
 	l.dropped.Add(1)
-	l.report("audit event queue is full; dropping event", nil)
 }
 
 func (l *Logger) drop(message string, err error) {
@@ -498,8 +538,12 @@ func (l *Logger) report(message string, err error) {
 
 func (l *Logger) event(req *http.Request, data *requestContext, metrics httpsnoop.Metrics, started time.Time) Event {
 	srcEndpoint, forwardedFor := sourceEndpoint(req, l.options.UseForwardedFor)
+	responseCode := metrics.Code
+	if data.upstreamStatusCode == http.StatusSwitchingProtocols && metrics.Code == http.StatusOK && metrics.Written == 0 {
+		responseCode = data.upstreamStatusCode
+	}
 	status, statusID := statusSuccessName, statusSuccessID
-	if metrics.Code >= http.StatusBadRequest {
+	if responseCode >= http.StatusBadRequest {
 		status, statusID = statusFailureName, statusFailureID
 	}
 
@@ -533,7 +577,7 @@ func (l *Logger) event(req *http.Request, data *requestContext, metrics httpsnoo
 			XForwardedFor: forwardedFor,
 		},
 		HTTPResponse: HTTPResponse{
-			Code:       metrics.Code,
+			Code:       responseCode,
 			BodyLength: metrics.Written,
 			Latency:    metrics.Duration.Milliseconds(),
 		},
@@ -541,7 +585,7 @@ func (l *Logger) event(req *http.Request, data *requestContext, metrics httpsnoo
 		DstEndpoint: destinationEndpoint(l.options.UpstreamURL),
 		StatusID:    statusID,
 		Status:      status,
-		StatusCode:  strconv.Itoa(metrics.Code),
+		StatusCode:  strconv.Itoa(responseCode),
 	}
 
 	resource := l.options.Resource
@@ -551,11 +595,13 @@ func (l *Logger) event(req *http.Request, data *requestContext, metrics httpsnoo
 	if resource.Namespace == "" {
 		resource.Namespace = data.resource.Namespace
 	}
-	if resource.Name == "" {
-		resource.Name = l.options.AuthorizationResource.Name
-	}
-	if resource.Namespace == "" {
-		resource.Namespace = l.options.AuthorizationResource.Namespace
+	if !data.authorizationEndpointMatched {
+		if resource.Name == "" {
+			resource.Name = l.options.AuthorizationResource.Name
+		}
+		if resource.Namespace == "" {
+			resource.Namespace = l.options.AuthorizationResource.Namespace
+		}
 	}
 	if resource.Name != "" {
 		event.Resources = []Resource{{

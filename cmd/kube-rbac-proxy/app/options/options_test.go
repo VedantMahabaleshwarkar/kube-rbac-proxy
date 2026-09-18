@@ -19,9 +19,40 @@ package options
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/brancz/kube-rbac-proxy/pkg/audit"
 )
+
+func TestAuthTimeoutFlag(t *testing.T) {
+	o := NewProxyRunOptions()
+	if o.AuthTimeout != 30*time.Second {
+		t.Fatalf("default auth timeout = %v, want 30s", o.AuthTimeout)
+	}
+
+	flagSets := o.Flags()
+	flagSet := flagSets.FlagSet("kube-rbac-proxy")
+	if flagSet.Lookup("auth-timeout") == nil {
+		t.Fatal("flag --auth-timeout is not registered")
+	}
+	if err := flagSet.Set("auth-timeout", "250ms"); err != nil {
+		t.Fatalf("set --auth-timeout: %v", err)
+	}
+	if o.AuthTimeout != 250*time.Millisecond {
+		t.Fatalf("parsed auth timeout = %v, want 250ms", o.AuthTimeout)
+	}
+}
+
+func TestValidateRejectsNegativeAuthTimeout(t *testing.T) {
+	o := NewProxyRunOptions()
+	o.Flags()
+	o.AuthTimeout = -time.Second
+
+	err := o.Validate()
+	if err == nil || !strings.Contains(err.Error(), "--auth-timeout cannot be negative") {
+		t.Fatalf("Validate() error = %v, want negative auth timeout error", err)
+	}
+}
 
 func TestAuditFlags(t *testing.T) {
 	o := NewProxyRunOptions()

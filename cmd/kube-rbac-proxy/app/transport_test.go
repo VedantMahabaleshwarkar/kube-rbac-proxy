@@ -88,19 +88,31 @@ func (b *notifyingBody) Close() error {
 	return nil
 }
 
-func TestWithResponseHeaderTimeoutDisabledReturnsUnderlyingTransport(t *testing.T) {
+type readWriteBody struct {
+	io.Reader
+}
+
+func (*readWriteBody) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+
+func (*readWriteBody) Close() error {
+	return nil
+}
+
+func TestWithUpstreamTimeoutDisabledReturnsUnderlyingTransport(t *testing.T) {
 	next := &stubRoundTripper{roundTrip: func(*http.Request) (*http.Response, error) {
 		return nil, nil
 	}}
 
 	for _, timeout := range []time.Duration{0, -time.Second} {
-		if got := withResponseHeaderTimeout(next, timeout); got != next {
-			t.Errorf("withResponseHeaderTimeout(%v) returned %T, want underlying transport", timeout, got)
+		if got := withUpstreamTimeout(next, timeout); got != next {
+			t.Errorf("withUpstreamTimeout(%v) returned %T, want underlying transport", timeout, got)
 		}
 	}
 }
 
-func TestResponseHeaderTimeoutReturnsDeadlineExceeded(t *testing.T) {
+func TestUpstreamTimeoutReturnsDeadlineExceeded(t *testing.T) {
 	closed := make(chan struct{})
 	next := &stubRoundTripper{roundTrip: func(req *http.Request) (*http.Response, error) {
 		<-req.Context().Done()
@@ -117,7 +129,7 @@ func TestResponseHeaderTimeoutReturnsDeadlineExceeded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	resp, err := withResponseHeaderTimeout(next, 10*time.Millisecond).RoundTrip(req)
+	resp, err := withUpstreamTimeout(next, 10*time.Millisecond).RoundTrip(req)
 	if resp != nil {
 		t.Fatalf("response = %#v, want nil", resp)
 	}
@@ -131,7 +143,7 @@ func TestResponseHeaderTimeoutReturnsDeadlineExceeded(t *testing.T) {
 	}
 }
 
-func TestResponseHeaderTimeoutPreservesStreamingBody(t *testing.T) {
+func TestUpstreamTimeoutPreservesStreamingBody(t *testing.T) {
 	const payload = "streamed after headers"
 	timeout := 10 * time.Millisecond
 	next := &stubRoundTripper{roundTrip: func(req *http.Request) (*http.Response, error) {
@@ -149,7 +161,7 @@ func TestResponseHeaderTimeoutPreservesStreamingBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	resp, err := withResponseHeaderTimeout(next, timeout).RoundTrip(req)
+	resp, err := withUpstreamTimeout(next, timeout).RoundTrip(req)
 	if err != nil {
 		t.Fatalf("round trip: %v", err)
 	}
@@ -164,7 +176,29 @@ func TestResponseHeaderTimeoutPreservesStreamingBody(t *testing.T) {
 	}
 }
 
-func TestResponseHeaderTimeoutBodyCloseCancelsChildContext(t *testing.T) {
+func TestUpstreamTimeoutPreservesProtocolUpgradeBody(t *testing.T) {
+	next := &stubRoundTripper{roundTrip: func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusSwitchingProtocols,
+			Body:       &readWriteBody{Reader: strings.NewReader("upgraded connection")},
+		}, nil
+	}}
+
+	req, err := http.NewRequest(http.MethodGet, "http://upstream.example", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := withUpstreamTimeout(next, time.Second).RoundTrip(req)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	defer resp.Body.Close()
+	if _, ok := resp.Body.(io.ReadWriteCloser); !ok {
+		t.Fatalf("101 response body type = %T, want io.ReadWriteCloser", resp.Body)
+	}
+}
+
+func TestUpstreamTimeoutBodyCloseCancelsChildContext(t *testing.T) {
 	requestContext := make(chan context.Context, 1)
 	next := &stubRoundTripper{roundTrip: func(req *http.Request) (*http.Response, error) {
 		requestContext <- req.Context()
@@ -178,7 +212,7 @@ func TestResponseHeaderTimeoutBodyCloseCancelsChildContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	resp, err := withResponseHeaderTimeout(next, time.Second).RoundTrip(req)
+	resp, err := withUpstreamTimeout(next, time.Second).RoundTrip(req)
 	if err != nil {
 		t.Fatalf("round trip: %v", err)
 	}
@@ -199,7 +233,7 @@ func TestResponseHeaderTimeoutBodyCloseCancelsChildContext(t *testing.T) {
 	}
 }
 
-func TestResponseHeaderTimeoutBodyCloseCancelsExactlyOnce(t *testing.T) {
+func TestUpstreamTimeoutBodyCloseCancelsExactlyOnce(t *testing.T) {
 	var cancelCalls atomic.Int32
 	body := &cancelOnCloseReadCloser{
 		ReadCloser: io.NopCloser(strings.NewReader("response")),
@@ -218,7 +252,7 @@ func TestResponseHeaderTimeoutBodyCloseCancelsExactlyOnce(t *testing.T) {
 	}
 }
 
-func TestResponseHeaderTimeoutNilBodyCancelsChildContext(t *testing.T) {
+func TestUpstreamTimeoutNilBodyCancelsChildContext(t *testing.T) {
 	requestContext := make(chan context.Context, 1)
 	next := &stubRoundTripper{roundTrip: func(req *http.Request) (*http.Response, error) {
 		requestContext <- req.Context()
@@ -229,7 +263,7 @@ func TestResponseHeaderTimeoutNilBodyCancelsChildContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	if _, err := withResponseHeaderTimeout(next, time.Second).RoundTrip(req); err != nil {
+	if _, err := withUpstreamTimeout(next, time.Second).RoundTrip(req); err != nil {
 		t.Fatalf("round trip: %v", err)
 	}
 	ctx := <-requestContext
@@ -240,7 +274,7 @@ func TestResponseHeaderTimeoutNilBodyCancelsChildContext(t *testing.T) {
 	}
 }
 
-func TestResponseHeaderTimeoutRoundTripErrorCancelsChildContext(t *testing.T) {
+func TestUpstreamTimeoutRoundTripErrorCancelsChildContext(t *testing.T) {
 	requestContext := make(chan context.Context, 1)
 	wantErr := errors.New("upstream round trip failed")
 	next := &stubRoundTripper{roundTrip: func(req *http.Request) (*http.Response, error) {
@@ -252,7 +286,7 @@ func TestResponseHeaderTimeoutRoundTripErrorCancelsChildContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	resp, err := withResponseHeaderTimeout(next, time.Second).RoundTrip(req)
+	resp, err := withUpstreamTimeout(next, time.Second).RoundTrip(req)
 	if resp != nil {
 		t.Fatalf("response = %#v, want nil", resp)
 	}
@@ -270,7 +304,7 @@ func TestResponseHeaderTimeoutRoundTripErrorCancelsChildContext(t *testing.T) {
 	}
 }
 
-func TestResponseHeaderTimeoutPreservesParentCancellation(t *testing.T) {
+func TestUpstreamTimeoutPreservesParentCancellation(t *testing.T) {
 	timeout := 30 * time.Second
 	parentErr := errors.New("parent request canceled")
 	started := make(chan struct{})
@@ -290,7 +324,7 @@ func TestResponseHeaderTimeoutPreservesParentCancellation(t *testing.T) {
 	timerCallback := make(chan func(), 1)
 	testTimer := time.NewTimer(time.Hour)
 	defer testTimer.Stop()
-	roundTripper := &responseHeaderTimeoutRoundTripper{
+	roundTripper := &upstreamTimeoutRoundTripper{
 		next:    next,
 		timeout: timeout,
 		afterFunc: func(_ time.Duration, callback func()) *time.Timer {
@@ -332,6 +366,129 @@ func TestResponseHeaderTimeoutPreservesParentCancellation(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("round trip did not return after parent cancellation")
+	}
+}
+
+func TestUpstreamTimeoutIncludesRequestWrite(t *testing.T) {
+	roundTripStarted := make(chan struct{})
+	timerCallback := make(chan func(), 1)
+	releaseRoundTrip := make(chan struct{})
+	testTimer := time.NewTimer(time.Hour)
+	defer testTimer.Stop()
+	defer close(releaseRoundTrip)
+
+	next := &stubRoundTripper{roundTrip: func(req *http.Request) (*http.Response, error) {
+		close(roundTripStarted)
+		select {
+		case <-req.Context().Done():
+			return nil, context.Cause(req.Context())
+		case <-releaseRoundTrip:
+			return nil, errors.New("released without timeout")
+		}
+	}}
+	roundTripper := &upstreamTimeoutRoundTripper{
+		next:    next,
+		timeout: time.Second,
+		afterFunc: func(_ time.Duration, callback func()) *time.Timer {
+			timerCallback <- callback
+			return testTimer
+		},
+	}
+
+	req, err := http.NewRequest(http.MethodPost, "http://upstream.example", strings.NewReader("request body"))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := roundTripper.RoundTrip(req)
+		result <- err
+	}()
+
+	<-roundTripStarted
+	select {
+	case callback := <-timerCallback:
+		callback()
+	case <-time.After(time.Second):
+		t.Fatal("upstream timeout did not start before request writing completed")
+	}
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("RoundTrip() error = %v, want context.DeadlineExceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("round trip did not return after response header timeout")
+	}
+}
+
+func TestUpstreamTimeoutUsesRemainingRequestBudget(t *testing.T) {
+	start := time.Date(2026, time.September, 18, 10, 0, 0, 0, time.UTC)
+	budget := requestTimeoutBudget{upstreamDeadline: start.Add(500 * time.Millisecond)}
+	ctx := context.WithValue(context.Background(), requestTimeoutBudgetContextKey{}, budget)
+
+	var timerDuration time.Duration
+	testTimer := time.NewTimer(time.Hour)
+	defer testTimer.Stop()
+	next := &stubRoundTripper{roundTrip: func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusNoContent,
+			Body:       http.NoBody,
+		}, nil
+	}}
+	roundTripper := &upstreamTimeoutRoundTripper{
+		next:    next,
+		timeout: time.Minute,
+		now:     func() time.Time { return start.Add(400 * time.Millisecond) },
+		afterFunc: func(timeout time.Duration, _ func()) *time.Timer {
+			timerDuration = timeout
+			return testTimer
+		},
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://upstream.example", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := roundTripper.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip() error: %v", err)
+	}
+	defer resp.Body.Close()
+	if timerDuration != 100*time.Millisecond {
+		t.Fatalf("upstream timer duration = %v, want remaining request budget 100ms", timerDuration)
+	}
+}
+
+func TestUpstreamTimeoutPreservesRequestWriteFailure(t *testing.T) {
+	wantErr := errors.New("request write failed")
+	var timerStarts atomic.Int32
+	next := &stubRoundTripper{roundTrip: func(*http.Request) (*http.Response, error) {
+		return nil, wantErr
+	}}
+	roundTripper := &upstreamTimeoutRoundTripper{
+		next:    next,
+		timeout: time.Second,
+		afterFunc: func(time.Duration, func()) *time.Timer {
+			timerStarts.Add(1)
+			return time.NewTimer(time.Hour)
+		},
+	}
+
+	req, err := http.NewRequest(http.MethodPost, "http://upstream.example", strings.NewReader("request body"))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := roundTripper.RoundTrip(req)
+	if resp != nil {
+		t.Fatalf("response = %#v, want nil", resp)
+	}
+	if err != wantErr {
+		t.Fatalf("RoundTrip() error = %v, want unchanged write error %v", err, wantErr)
+	}
+	if got := timerStarts.Load(); got != 1 {
+		t.Fatalf("upstream timer starts = %d, want 1 before request writing", got)
 	}
 }
 

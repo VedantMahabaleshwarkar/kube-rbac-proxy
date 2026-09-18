@@ -32,7 +32,10 @@ import (
 	"github.com/spf13/pflag"
 )
 
-const defaultUpstreamTimeout = 30 * time.Second
+const (
+	defaultUpstreamTimeout = 30 * time.Second
+	defaultAuthTimeout     = 30 * time.Second
+)
 
 type ProxyRunOptions struct {
 	ConfigFileName string
@@ -45,6 +48,7 @@ type ProxyRunOptions struct {
 	UpstreamTimeout    time.Duration
 	UpstreamForceH2C   bool
 	UpstreamCAFile     string
+	AuthTimeout        time.Duration
 	Auth               *proxy.Config
 	TLS                *TLSConfig
 	KubeconfigLocation string
@@ -82,6 +86,7 @@ type TLSConfig struct {
 func NewProxyRunOptions() *ProxyRunOptions {
 	return &ProxyRunOptions{
 		UpstreamTimeout: defaultUpstreamTimeout,
+		AuthTimeout:     defaultAuthTimeout,
 		Auth: &proxy.Config{
 			Authentication: &authn.AuthnConfig{
 				X509:   &authn.X509Config{},
@@ -104,7 +109,7 @@ func (o *ProxyRunOptions) Flags() k8sapiflag.NamedFlagSets {
 	flagset.StringVar(&o.InsecureListenAddress, "insecure-listen-address", "", "[DEPRECATED] The address the kube-rbac-proxy HTTP server should listen on.")
 	flagset.StringVar(&o.SecureListenAddress, "secure-listen-address", "", "The address the kube-rbac-proxy HTTPs server should listen on.")
 	flagset.StringVar(&o.Upstream, "upstream", "", "The upstream URL to proxy to once requests have successfully been authenticated and authorized.")
-	flagset.DurationVar(&o.UpstreamTimeout, "upstream-timeout", 30*time.Second, "Maximum amount of time the server will wait for upstream response headers.")
+	flagset.DurationVar(&o.UpstreamTimeout, "upstream-timeout", defaultUpstreamTimeout, "Maximum total time from request start through authentication, authorization, writing the upstream request, and receiving upstream response headers. A value of 0 disables the overall timeout; response-body streaming is not limited.")
 	flagset.BoolVar(&o.UpstreamForceH2C, "upstream-force-h2c", false, "Force h2c to communicate with the upstream. This is required when the upstream speaks h2c(http/2 cleartext - insecure variant of http/2) only. For example, go-grpc server in the insecure mode, such as helm's tiller w/o TLS, speaks h2c only")
 	flagset.StringVar(&o.UpstreamCAFile, "upstream-ca-file", "", "The CA the upstream uses for TLS connection. This is required when the upstream uses TLS and its own CA certificate")
 	flagset.StringVar(&o.ConfigFileName, "config-file", "", "Configuration file to configure kube-rbac-proxy.")
@@ -129,6 +134,7 @@ func (o *ProxyRunOptions) Flags() k8sapiflag.NamedFlagSets {
 	flagset.StringVar(&o.Auth.Authentication.Header.GroupsFieldName, "auth-header-groups-field-name", "x-remote-groups", "The name of the field inside a http(2) request header to tell the upstream server about the user's groups")
 	flagset.StringVar(&o.Auth.Authentication.Header.GroupSeparator, "auth-header-groups-field-separator", "|", "The separator string used for concatenating multiple group names in a groups header field's value")
 	flagset.StringSliceVar(&o.Auth.Authentication.Token.Audiences, "auth-token-audiences", []string{}, "Comma-separated list of token audiences to accept. By default a token does not have to have any specific audience. It is recommended to set a specific audience.")
+	flagset.DurationVar(&o.AuthTimeout, "auth-timeout", defaultAuthTimeout, "Maximum amount of time allowed for authentication and authorization together. The earlier of this limit and --upstream-timeout applies. A value of 0 disables only the auth-specific limit.")
 
 	//Authn OIDC flags
 	flagset.StringVar(&o.Auth.Authentication.OIDC.IssuerURL, "oidc-issuer", "", "The URL of the OpenID issuer, only HTTPS scheme will be accepted. If set, it will be used to verify the OIDC JSON Web Token (JWT).")
@@ -206,6 +212,10 @@ For more information, please go to https://github.com/brancz/kube-rbac-proxy/iss
 
 	if err := o.AuditLogProfile.Validate(); err != nil {
 		errs = append(errs, err)
+	}
+
+	if o.AuthTimeout < 0 {
+		errs = append(errs, fmt.Errorf("--auth-timeout cannot be negative"))
 	}
 
 	for _, pathAllowed := range o.AllowPaths {
